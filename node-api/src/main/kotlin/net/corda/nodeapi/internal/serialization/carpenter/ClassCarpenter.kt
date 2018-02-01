@@ -79,8 +79,10 @@ private val jlClass get() = Type.getInternalName(Class::class.java)
  *
  * Equals/hashCode methods are not yet supported.
  */
-class ClassCarpenter(cl: ClassLoader = Thread.currentThread().contextClassLoader,
-                     val whitelist: ClassWhitelist) {
+class ClassCarpenter(
+    cl: ClassLoader = Thread.currentThread().contextClassLoader,
+    val whitelist: ClassWhitelist
+) {
     // TODO: Generics.
     // TODO: Sandbox the generated code when a security manager is in use.
     // TODO: Generate equals/hashCode.
@@ -104,8 +106,8 @@ class ClassCarpenter(cl: ClassLoader = Thread.currentThread().contextClassLoader
      */
     fun build(schema: Schema): Class<*> {
         validateSchema(schema)
-        // Walk up the inheritance hierarchy and then start walking back down once we either hit the top, or
-        // find a class we haven't generated yet.
+        // Walk up the inheritance hierarchy until we hit either the top or a class we've already generated,
+        // then walk back down it generating classes.
         val hierarchy = ArrayList<Schema>()
         hierarchy += schema
         var cursor = schema.superclass
@@ -281,16 +283,16 @@ class ClassCarpenter(cl: ClassLoader = Thread.currentThread().contextClassLoader
             visitInsn(DUP)
 
             var idx = 0
-            schema.fields.forEach {
+            schema.fields.keys.forEach { key ->
                 visitInsn(DUP)
                 visitIntInsn(BIPUSH, idx)
                 visitTypeInsn(NEW, schema.jvmName)
                 visitInsn(DUP)
-                visitLdcInsn(it.key)
+                visitLdcInsn(key)
                 visitIntInsn(BIPUSH, idx++)
                 visitMethodInsn(INVOKESPECIAL, schema.jvmName, "<init>", "(L$jlString;I)V", false)
                 visitInsn(DUP)
-                visitFieldInsn(PUTSTATIC, schema.jvmName, it.key, "L${schema.jvmName};")
+                visitFieldInsn(PUTSTATIC, schema.jvmName, key, "L${schema.jvmName};")
                 visitInsn(AASTORE)
             }
 
@@ -356,20 +358,18 @@ class ClassCarpenter(cl: ClassLoader = Thread.currentThread().contextClassLoader
             visitCode()
 
             // Calculate the super call.
-            val superclassFields = schema.superclass?.fieldsIncludingSuperclasses() ?: emptyMap()
             visitVarInsn(ALOAD, 0)
             val sc = schema.superclass
+            var slot = 1
             if (sc == null) {
                 visitMethodInsn(INVOKESPECIAL, jlObject, "<init>", "()V", false)
             } else {
-                var slot = 1
-                superclassFields.values.forEach { slot += load(slot, it) }
+                slot = sc.fieldsIncludingSuperclasses().values.fold(slot) { acc, field -> acc + load(acc, field) }
                 val superDesc = sc.descriptorsIncludingSuperclasses().values.joinToString("")
                 visitMethodInsn(INVOKESPECIAL, sc.name.jvm, "<init>", "($superDesc)V", false)
             }
 
             // Assign the fields from parameters.
-            var slot = 1 + superclassFields.size
             for ((name, field) in schema.fields) {
                 (field as ClassField).nullTest(this, slot)
 

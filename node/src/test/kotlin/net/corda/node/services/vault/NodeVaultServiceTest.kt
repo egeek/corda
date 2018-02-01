@@ -5,19 +5,18 @@ import com.nhaarman.mockito_kotlin.argThat
 import com.nhaarman.mockito_kotlin.doNothing
 import com.nhaarman.mockito_kotlin.whenever
 import net.corda.core.contracts.*
+import net.corda.core.crypto.Crypto
 import net.corda.core.crypto.NullKeys
+import net.corda.core.crypto.SignatureMetadata
 import net.corda.core.crypto.generateKeyPair
 import net.corda.core.identity.*
+import net.corda.core.internal.NotaryChangeTransactionBuilder
 import net.corda.core.internal.packageName
 import net.corda.core.node.StatesToRecord
-import net.corda.core.node.services.StatesNotAvailableException
-import net.corda.core.node.services.Vault
-import net.corda.core.node.services.VaultService
-import net.corda.core.node.services.queryBy
+import net.corda.core.node.services.*
 import net.corda.core.node.services.vault.PageSpecification
 import net.corda.core.node.services.vault.QueryCriteria
 import net.corda.core.node.services.vault.QueryCriteria.*
-import net.corda.core.transactions.NotaryChangeWireTransaction
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.transactions.TransactionBuilder
 import net.corda.core.utilities.NonEmptySet
@@ -29,6 +28,7 @@ import net.corda.finance.contracts.getCashBalance
 import net.corda.finance.schemas.CashSchemaV1
 import net.corda.finance.utils.sumCash
 import net.corda.node.services.api.IdentityServiceInternal
+import net.corda.node.services.api.WritableTransactionStorage
 import net.corda.nodeapi.internal.persistence.CordaPersistence
 import net.corda.testing.core.*
 import net.corda.testing.internal.LogHelper
@@ -36,8 +36,7 @@ import net.corda.testing.internal.rigorousMock
 import net.corda.testing.internal.vault.VaultFiller
 import net.corda.testing.node.MockServices
 import net.corda.testing.node.makeTestIdentityService
-import org.assertj.core.api.Assertions.assertThat
-import org.assertj.core.api.Assertions.assertThatExceptionOfType
+import org.assertj.core.api.Assertions.*
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
@@ -53,7 +52,7 @@ import kotlin.test.assertTrue
 
 class NodeVaultServiceTest {
     private companion object {
-        val cordappPackages = listOf("net.corda.finance.contracts.asset", CashSchemaV1::class.packageName)
+        val cordappPackages = listOf("net.corda.finance.contracts.asset", CashSchemaV1::class.packageName, "net.corda.testing.internal.vault")
         val dummyCashIssuer = TestIdentity(CordaX500Name("Snake Oil Issuer", "London", "GB"), 10)
         val DUMMY_CASH_ISSUER = dummyCashIssuer.ref(1)
         val bankOfCorda = TestIdentity(BOC_NAME)
@@ -96,8 +95,8 @@ class NodeVaultServiceTest {
         vaultFiller = VaultFiller(services, dummyNotary)
         // This is safe because MockServices only ever have a single identity
         identity = services.myInfo.singleIdentityAndCert()
-        issuerServices = MockServices(cordappPackages, rigorousMock(), dummyCashIssuer)
-        bocServices = MockServices(cordappPackages, rigorousMock(), bankOfCorda)
+        issuerServices = MockServices(cordappPackages, dummyCashIssuer, rigorousMock<IdentityService>())
+        bocServices = MockServices(cordappPackages, bankOfCorda, rigorousMock<IdentityService>())
         services.identityService.verifyAndRegisterIdentity(DUMMY_CASH_ISSUER_IDENTITY)
         services.identityService.verifyAndRegisterIdentity(BOC_IDENTITY)
     }
@@ -137,11 +136,11 @@ class NodeVaultServiceTest {
             assertThat(w1).hasSize(3)
 
             val originalVault = vaultService
-            val services2 = object : MockServices(emptyList(), rigorousMock(), MEGA_CORP.name) {
+            val services2 = object : MockServices(emptyList(), MEGA_CORP.name, rigorousMock()) {
                 override val vaultService: NodeVaultService get() = originalVault
                 override fun recordTransactions(statesToRecord: StatesToRecord, txs: Iterable<SignedTransaction>) {
                     for (stx in txs) {
-                        validatedTransactions.addTransaction(stx)
+                        (validatedTransactions as WritableTransactionStorage).addTransaction(stx)
                         vaultService.notify(statesToRecord, stx.tx)
                     }
                 }
@@ -480,7 +479,7 @@ class NodeVaultServiceTest {
 
     @Test
     fun addNoteToTransaction() {
-        val megaCorpServices = MockServices(cordappPackages, rigorousMock(), MEGA_CORP.name, MEGA_CORP_KEY)
+        val megaCorpServices = MockServices(cordappPackages, MEGA_CORP.name, rigorousMock(), MEGA_CORP_KEY)
         database.transaction {
             val freshKey = identity.owningKey
 
@@ -553,7 +552,7 @@ class NodeVaultServiceTest {
 
         // ensure transaction contract state is persisted in DBStorage
         val signedIssuedTx = services.signInitialTransaction(issueBuilder)
-        services.validatedTransactions.addTransaction(signedIssuedTx)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(signedIssuedTx)
 
         database.transaction { vaultService.notify(StatesToRecord.ONLY_RELEVANT, issueTx) }
         val expectedIssueUpdate = Vault.Update(emptySet(), setOf(cashState), null)
@@ -569,7 +568,7 @@ class NodeVaultServiceTest {
 
         // ensure transaction contract state is persisted in DBStorage
         val signedMoveTx = services.signInitialTransaction(issueBuilder)
-        services.validatedTransactions.addTransaction(signedMoveTx)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(signedMoveTx)
 
         val observedUpdates = vaultSubscriber.onNextEvents
         assertEquals(observedUpdates, listOf(expectedIssueUpdate, expectedMoveUpdate))
@@ -587,9 +586,9 @@ class NodeVaultServiceTest {
         val identity = services.myInfo.singleIdentityAndCert()
         assertEquals(services.identityService.partyFromKey(identity.owningKey), identity.party)
         val anonymousIdentity = services.keyManagementService.freshKeyAndCert(identity, false)
-        val thirdPartyServices = MockServices(emptyList(), rigorousMock<IdentityServiceInternal>().also {
+        val thirdPartyServices = MockServices(emptyList(), MEGA_CORP.name, rigorousMock<IdentityServiceInternal>().also {
             doNothing().whenever(it).justVerifyAndRegisterIdentity(argThat { name == MEGA_CORP.name })
-        }, MEGA_CORP.name)
+        })
         val thirdPartyIdentity = thirdPartyServices.keyManagementService.freshKeyAndCert(thirdPartyServices.myInfo.singleIdentityAndCert(), false)
         val amount = Amount(1000, Issued(BOC.ref(1), GBP))
 
@@ -599,14 +598,14 @@ class NodeVaultServiceTest {
         }
         val issueStx = bocServices.signInitialTransaction(issueTxBuilder)
         // We need to record the issue transaction so inputs can be resolved for the notary change transaction
-        services.validatedTransactions.addTransaction(issueStx)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(issueStx)
 
         val initialCashState = StateAndRef(issueStx.tx.outputs.single(), StateRef(issueStx.id, 0))
 
         // Change notary
         services.identityService.verifyAndRegisterIdentity(DUMMY_NOTARY_IDENTITY)
         val newNotary = DUMMY_NOTARY
-        val changeNotaryTx = NotaryChangeWireTransaction(listOf(initialCashState.ref), issueStx.notary!!, newNotary)
+        val changeNotaryTx = NotaryChangeTransactionBuilder(listOf(initialCashState.ref), issueStx.notary!!, newNotary).build()
         val cashStateWithNewNotary = StateAndRef(initialCashState.state.copy(notary = newNotary), StateRef(changeNotaryTx.id, 0))
 
         database.transaction {
@@ -614,7 +613,7 @@ class NodeVaultServiceTest {
         }
 
         // ensure transaction contract state is persisted in DBStorage
-        services.validatedTransactions.addTransaction(SignedTransaction(changeNotaryTx, listOf(NullKeys.NULL_SIGNATURE)))
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(SignedTransaction(changeNotaryTx, listOf(NullKeys.NULL_SIGNATURE)))
 
         // Move cash
         val moveTxBuilder = database.transaction {
@@ -626,7 +625,7 @@ class NodeVaultServiceTest {
 
         // ensure transaction contract state is persisted in DBStorage
         val signedMoveTx = services.signInitialTransaction(moveTxBuilder)
-        services.validatedTransactions.addTransaction(signedMoveTx)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(signedMoveTx)
 
         database.transaction {
             service.notify(StatesToRecord.ONLY_RELEVANT, moveTx)
@@ -660,7 +659,7 @@ class NodeVaultServiceTest {
 
         // ensure transaction contract state is persisted in DBStorage
         val signedTxb = services.signInitialTransaction(txb)
-        services.validatedTransactions.addTransaction(signedTxb)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(signedTxb)
 
         // Check that it was ignored as irrelevant.
         assertEquals(currentCashStates, countCash())
@@ -670,5 +669,68 @@ class NodeVaultServiceTest {
             vaultService.notify(StatesToRecord.ALL_VISIBLE, wtx)
         }
         assertEquals(currentCashStates + 1, countCash())
+    }
+
+    @Test
+    fun `insert equal cash states issued by single transaction`() {
+        val nodeIdentity = MEGA_CORP
+        val coins = listOf(1.DOLLARS, 1.DOLLARS).map { it.issuedBy(nodeIdentity.ref(1)) }
+
+        //create single transaction with 2 'identical' cash outputs
+        val txb = TransactionBuilder(DUMMY_NOTARY)
+        coins.map { txb.addOutputState(TransactionState(Cash.State(it, nodeIdentity), Cash.PROGRAM_ID, DUMMY_NOTARY)) }
+        txb.addCommand(Cash.Commands.Issue(), nodeIdentity.owningKey)
+        val issueTx = txb.toWireTransaction(services)
+
+        // ensure transaction contract state is persisted in DBStorage
+        val signedIssuedTx = services.signInitialTransaction(txb)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(signedIssuedTx)
+
+        database.transaction { vaultService.notify(StatesToRecord.ONLY_RELEVANT, issueTx) }
+
+        val recordedStates = database.transaction {
+            vaultService.queryBy<Cash.State>().states.size
+        }
+        assertThat(recordedStates).isEqualTo(coins.size)
+    }
+
+    @Test
+    fun `insert different cash states issued by single transaction`() {
+        val nodeIdentity = MEGA_CORP
+        val coins = listOf(2.DOLLARS, 1.DOLLARS).map { it.issuedBy(nodeIdentity.ref(1)) }
+
+        //create single transaction with 2 'identical' cash outputs
+        val txb = TransactionBuilder(DUMMY_NOTARY)
+        coins.map { txb.addOutputState(TransactionState(Cash.State(it, nodeIdentity), Cash.PROGRAM_ID, DUMMY_NOTARY)) }
+        txb.addCommand(Cash.Commands.Issue(), nodeIdentity.owningKey)
+        val issueTx = txb.toWireTransaction(services)
+
+        // ensure transaction contract state is persisted in DBStorage
+        val signedIssuedTx = services.signInitialTransaction(txb)
+        (services.validatedTransactions as WritableTransactionStorage).addTransaction(signedIssuedTx)
+
+        database.transaction { vaultService.notify(StatesToRecord.ONLY_RELEVANT, issueTx) }
+
+        val recordedStates = database.transaction {
+            vaultService.queryBy<Cash.State>().states.size
+        }
+        assertThat(recordedStates).isEqualTo(coins.size)
+    }
+
+    @Test
+    fun `record a transaction with number of inputs greater than vault page size`() {
+        val notary = dummyNotary
+        val issuerKey = notary.keyPair
+        val signatureMetadata = SignatureMetadata(services.myInfo.platformVersion, Crypto.findSignatureScheme(issuerKey.public).schemeNumberID)
+        val states = database.transaction {
+            vaultFiller.fillWithSomeTestLinearStates(PageSpecification().pageSize + 1).states
+        }
+
+        database.transaction {
+            val statesExitingTx = TransactionBuilder(notary.party).withItems(*states.toList().toTypedArray()).addCommand(dummyCommand())
+            val signedStatesExitingTx = services.signInitialTransaction(statesExitingTx).withAdditionalSignature(issuerKey, signatureMetadata)
+
+            assertThatCode { services.recordTransactions(signedStatesExitingTx) }.doesNotThrowAnyException()
+        }
     }
 }

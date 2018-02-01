@@ -14,8 +14,7 @@ import bftsmart.tom.server.defaultservices.DefaultReplier
 import bftsmart.tom.util.Extractor
 import net.corda.core.contracts.StateRef
 import net.corda.core.crypto.*
-import net.corda.core.flows.NotaryError
-import net.corda.core.flows.NotaryException
+import net.corda.core.flows.*
 import net.corda.core.identity.Party
 import net.corda.core.internal.declaredField
 import net.corda.core.internal.toTypedArray
@@ -25,8 +24,6 @@ import net.corda.core.serialization.CordaSerializable
 import net.corda.core.serialization.SingletonSerializeAsToken
 import net.corda.core.serialization.deserialize
 import net.corda.core.serialization.serialize
-import net.corda.core.transactions.FilteredTransaction
-import net.corda.core.transactions.SignedTransaction
 import net.corda.core.utilities.contextLogger
 import net.corda.core.utilities.debug
 import net.corda.node.services.api.ServiceHubInternal
@@ -52,20 +49,20 @@ import java.util.*
 object BFTSMaRt {
     /** Sent from [Client] to [Replica]. */
     @CordaSerializable
-    data class CommitRequest(val tx: Any, val callerIdentity: Party)
+    data class CommitRequest(val payload: NotarisationPayload, val callerIdentity: Party)
 
     /** Sent from [Replica] to [Client]. */
     @CordaSerializable
     sealed class ReplicaResponse {
-        data class Error(val error: NotaryError) : ReplicaResponse()
-        data class Signature(val txSignature: DigitalSignature) : ReplicaResponse()
+        data class Error(val error: SignedData<NotaryError>) : ReplicaResponse()
+        data class Signature(val txSignature: TransactionSignature) : ReplicaResponse()
     }
 
     /** An aggregate response from all replica ([Replica]) replies sent from [Client] back to the calling application. */
     @CordaSerializable
     sealed class ClusterResponse {
-        data class Error(val error: NotaryError) : ClusterResponse()
-        data class Signatures(val txSignatures: List<DigitalSignature>) : ClusterResponse()
+        data class Error(val errors: List<SignedData<NotaryError>>) : ClusterResponse()
+        data class Signatures(val txSignatures: List<TransactionSignature>) : ClusterResponse()
     }
 
     interface Cluster {
@@ -101,13 +98,12 @@ object BFTSMaRt {
          * Sends a transaction commit request to the BFT cluster. The [proxy] will deliver the request to every
          * replica, and block until a sufficient number of replies are received.
          */
-        fun commitTransaction(transaction: Any, otherSide: Party): ClusterResponse {
-            require(transaction is FilteredTransaction || transaction is SignedTransaction) { "Unsupported transaction type: ${transaction.javaClass.name}" }
+        fun commitTransaction(payload: NotarisationPayload, otherSide: Party): ClusterResponse {
             awaitClientConnectionToCluster()
             cluster.waitUntilAllReplicasHaveInitialized()
-            val requestBytes = CommitRequest(transaction, otherSide).serialize().bytes
+            val requestBytes = CommitRequest(payload, otherSide).serialize().bytes
             val responseBytes = proxy.invokeOrdered(requestBytes)
-            return responseBytes.deserialize<ClusterResponse>()
+            return responseBytes.deserialize()
         }
 
         /** A comparator to check if replies from two replicas are the same. */
@@ -138,7 +134,7 @@ object BFTSMaRt {
                     ClusterResponse.Signatures(accepted.map { it.txSignature })
                 } else {
                     log.debug { "Cluster response - error: ${rejected.first().error}" }
-                    ClusterResponse.Error(rejected.first().error)
+                    ClusterResponse.Error(rejected.map { it.error })
                 }
 
                 val messageContent = aggregateResponse.serialize().bytes
@@ -234,20 +230,22 @@ object BFTSMaRt {
                     }
                 } else {
                     log.debug { "Conflict detected – the following inputs have already been committed: ${conflicts.keys.joinToString()}" }
-                    val conflict = UniquenessProvider.Conflict(conflicts)
-                    val conflictData = conflict.serialize()
-                    val signedConflict = SignedData(conflictData, sign(conflictData.bytes))
-                    throw NotaryException(NotaryError.Conflict(txId, signedConflict))
+                    val conflict = conflicts.mapValues { StateConsumptionDetails(it.value.id.sha256()) }
+                    val error = NotaryError.Conflict(txId, conflict)
+                    throw NotaryInternalException(error)
                 }
             }
         }
 
+        /** Generates a signature over an arbitrary array of bytes. */
         protected fun sign(bytes: ByteArray): DigitalSignature.WithKey {
             return services.database.transaction { services.keyManagementService.sign(bytes, notaryIdentityKey) }
         }
 
-        protected fun sign(filteredTransaction: FilteredTransaction): TransactionSignature {
-            return services.database.transaction { services.createSignature(filteredTransaction, notaryIdentityKey) }
+        /** Generates a transaction signature over the specified transaction [txId]. */
+        protected fun sign(txId: SecureHash): TransactionSignature {
+            val signableData = SignableData(txId, SignatureMetadata(services.myInfo.platformVersion, Crypto.findSignatureScheme(notaryIdentityKey).schemeNumberID))
+            return services.database.transaction { services.keyManagementService.sign(signableData, notaryIdentityKey) }
         }
 
         // TODO:

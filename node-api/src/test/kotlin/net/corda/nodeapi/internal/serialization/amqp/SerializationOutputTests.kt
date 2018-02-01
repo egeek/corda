@@ -11,6 +11,7 @@ import net.corda.core.flows.FlowException
 import net.corda.core.identity.AbstractParty
 import net.corda.core.identity.CordaX500Name
 import net.corda.core.internal.AbstractAttachment
+import net.corda.core.serialization.ConstructorForDeserialization
 import net.corda.core.serialization.CordaSerializable
 import net.corda.core.serialization.MissingAttachmentsException
 import net.corda.core.serialization.SerializationFactory
@@ -20,6 +21,8 @@ import net.corda.nodeapi.internal.serialization.AllWhitelist
 import net.corda.nodeapi.internal.serialization.EmptyWhitelist
 import net.corda.nodeapi.internal.serialization.GeneratedAttachment
 import net.corda.nodeapi.internal.serialization.amqp.SerializerFactory.Companion.isPrimitive
+import net.corda.nodeapi.internal.serialization.amqp.testutils.testDefaultFactory
+import net.corda.nodeapi.internal.serialization.amqp.testutils.testDefaultFactoryNoEvolution
 import net.corda.testing.contracts.DummyContract
 import net.corda.testing.core.BOB_NAME
 import net.corda.testing.core.SerializationEnvironmentRule
@@ -45,6 +48,24 @@ import kotlin.reflect.full.superclasses
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+
+object AckWrapper {
+    object Ack
+
+    fun serialize() {
+        val factory = testDefaultFactoryNoEvolution()
+        SerializationOutput(factory).serialize(Ack)
+    }
+}
+
+object PrivateAckWrapper {
+    private object Ack
+
+    fun serialize() {
+        val factory = testDefaultFactoryNoEvolution()
+        SerializationOutput(factory).serialize(Ack)
+    }
+}
 
 class SerializationOutputTests {
     private companion object {
@@ -1061,6 +1082,7 @@ class SerializationOutputTests {
         val obj2 = serdes(obj, factory, factory2, expectedEqual = false, expectDeserializedEqual = false)
         assertEquals(obj.id, obj2.attachment.id)
         assertEquals(obj.contract, obj2.contract)
+        assertEquals(obj.additionalContracts, obj2.additionalContracts)
         assertArrayEquals(obj.open().readBytes(), obj2.open().readBytes())
     }
 
@@ -1079,5 +1101,76 @@ class SerializationOutputTests {
         assertThatThrownBy {
             serdes(obj, factory, factory2, expectedEqual = false, expectDeserializedEqual = false)
         }.isInstanceOf(MissingAttachmentsException::class.java)
+    }
+
+    //
+    // Example stacktrace that this test is tryint to reproduce
+    //
+    // java.lang.IllegalArgumentException:
+    //      net.corda.core.contracts.TransactionState ->
+    //      data(net.corda.core.contracts.ContractState) ->
+    //      net.corda.finance.contracts.asset.Cash$State ->
+    //      amount(net.corda.core.contracts.Amount<net.corda.core.contracts.Issued<java.util.Currency>>) ->
+    //      net.corda.core.contracts.Amount<net.corda.core.contracts.Issued<java.util.Currency>> ->
+    //      displayTokenSize(java.math.BigDecimal) ->
+    //      wrong number of arguments
+    //
+    // So the actual problem was objects with multiple getters. The code wasn't looking for one with zero
+    // properties, just taking the first one it found with with the most applicable type, and the reflection
+    // ordering of the methods was random, thus occasionally we select the wrong one
+    //
+    @Test
+    fun reproduceWrongNumberOfArguments() {
+        val field = SerializerFactory::class.java.getDeclaredField("serializersByType").apply {
+            this.isAccessible = true
+        }
+
+        data class C(val a: Amount<Currency>)
+
+        val factory = testDefaultFactoryNoEvolution()
+        factory.register(net.corda.nodeapi.internal.serialization.amqp.custom.BigDecimalSerializer)
+        factory.register(net.corda.nodeapi.internal.serialization.amqp.custom.CurrencySerializer)
+
+        val c = C(Amount<Currency>(100, BigDecimal("1.5"), Currency.getInstance("USD")))
+
+        // were the issue not fixed we'd blow up here
+        SerializationOutput(factory).serialize(c)
+    }
+
+    @Test
+    fun nestedObjects() {
+        // The "test" is that this doesn't throw, anything else is a success
+        AckWrapper.serialize()
+    }
+
+    @Test
+    fun privateNestedObjects() {
+        // The "test" is that this doesn't throw, anything else is a success
+        PrivateAckWrapper.serialize()
+    }
+
+    interface DataClassByInterface<V> {
+        val v : V
+    }
+
+    @Test
+    fun dataClassBy() {
+        data class C (val s: String) : DataClassByInterface<String> {
+            override val v: String = "-- $s"
+        }
+
+        data class Inner<T>(val wrapped: DataClassByInterface<T>) : DataClassByInterface<T> by wrapped {
+            override val v = wrapped.v
+        }
+
+        val i = Inner(C("hello"))
+
+        val bytes = SerializationOutput(testDefaultFactory()).serialize(i)
+
+        try {
+            val i2 = DeserializationInput(testDefaultFactory()).deserialize(bytes)
+        } catch (e : NotSerializableException) {
+            throw Error ("Deserializing serialized \$C should not throw")
+        }
     }
 }

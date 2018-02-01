@@ -1,12 +1,27 @@
 package net.corda.nodeapi.internal.serialization.amqp
 
+import net.corda.core.crypto.Crypto.generateKeyPair
+import net.corda.core.crypto.SignedData
+import net.corda.core.crypto.sign
+import net.corda.core.node.NetworkParameters
+import net.corda.core.node.NotaryInfo
+import net.corda.core.serialization.ConstructorForDeserialization
 import net.corda.core.serialization.DeprecatedConstructorForDeserialization
 import net.corda.core.serialization.SerializedBytes
 import net.corda.testing.common.internal.ProjectStructure.projectRootDir
+import net.corda.testing.core.DUMMY_NOTARY_NAME
+import net.corda.testing.core.TestIdentity
+import org.junit.Ignore
 import org.junit.Test
 import java.io.File
 import java.io.NotSerializableException
+import java.net.URI
+import java.time.Instant
 import kotlin.test.assertEquals
+import net.corda.nodeapi.internal.serialization.amqp.custom.InstantSerializer
+import net.corda.nodeapi.internal.serialization.amqp.testutils.TestSerializationOutput
+import net.corda.nodeapi.internal.serialization.amqp.testutils.testDefaultFactory
+import net.corda.nodeapi.internal.serialization.amqp.testutils.testName
 
 // To regenerate any of the binary test files do the following
 //
@@ -27,8 +42,8 @@ class EvolvabilityTests {
         val sf = testDefaultFactory()
         val resource = "EvolvabilityTests.simpleOrderSwapSameType"
 
-        val A = 1
-        val B = 2
+        val a = 1
+        val b = 2
 
         // Original version of the class for the serialised version of this class
         // data class C (val a: Int, val b: Int)
@@ -43,8 +58,8 @@ class EvolvabilityTests {
         val sc2 = f.readBytes()
         val deserializedC = DeserializationInput(sf).deserialize(SerializedBytes<C>(sc2))
 
-        assertEquals(A, deserializedC.a)
-        assertEquals(B, deserializedC.b)
+        assertEquals(a, deserializedC.a)
+        assertEquals(b, deserializedC.b)
     }
 
     @Test
@@ -193,6 +208,86 @@ class EvolvabilityTests {
 
         assertEquals(A, deserializedCC.a)
         assertEquals("hello", deserializedCC.b)
+    }
+
+    @Test
+    fun addMandatoryFieldWithAltConstructorForceReorder() {
+        val sf = testDefaultFactory()
+        val z = 30
+        val y = 20
+        val resource = "EvolvabilityTests.addMandatoryFieldWithAltConstructorForceReorder"
+
+        // Original version of the class as it was serialised
+        // data class CC(val z: Int, val y: Int)
+        // File(URI("$localPath/$resource")).writeBytes(SerializationOutput(sf).serialize(CC(z, y)).bytes)
+
+        @Suppress("UNUSED")
+        data class CC(val z: Int, val y: Int, val a: String) {
+            @DeprecatedConstructorForDeserialization(1)
+            constructor (z: Int, y: Int) : this(z, y, "10")
+        }
+
+        val url = EvolvabilityTests::class.java.getResource(resource)
+        val deserializedCC = DeserializationInput(sf).deserialize(SerializedBytes<CC>(url.readBytes()))
+
+        assertEquals("10", deserializedCC.a)
+        assertEquals(y, deserializedCC.y)
+        assertEquals(z, deserializedCC.z)
+    }
+
+    @Test
+    fun moreComplexNonNullWithReorder() {
+        val resource = "${javaClass.simpleName}.${testName()}"
+
+        data class NetworkParametersExample(
+                val minimumPlatformVersion: Int,
+                val notaries: List<String>,
+                val maxMessageSize: Int,
+                val maxTransactionSize: Int,
+                val modifiedTime: Instant,
+                val epoch: Int,
+                val whitelistedContractImplementations: Map<String, List<Int>>,
+                /* to regenerate test class, comment out this element */
+                val eventHorizon: Int
+        ) {
+            // when regenerating test class this won't be required
+            @DeprecatedConstructorForDeserialization(1)
+            @Suppress("UNUSED")
+            constructor (
+                    minimumPlatformVersion: Int,
+                    notaries: List<String>,
+                    maxMessageSize: Int,
+                    maxTransactionSize: Int,
+                    modifiedTime: Instant,
+                    epoch: Int,
+                    whitelistedContractImplementations: Map<String, List<Int>>
+            ) : this(minimumPlatformVersion,
+                    notaries,
+                    maxMessageSize,
+                    maxTransactionSize,
+                    modifiedTime,
+                    epoch,
+                    whitelistedContractImplementations,
+                    Int.MAX_VALUE)
+        }
+
+        val factory = testDefaultFactory().apply {
+            register(InstantSerializer(this))
+        }
+
+        // Uncomment to regenerate test case
+        // File(URI("$localPath/$resource")).writeBytes(SerializationOutput(factory).serialize(
+        //         NetworkParametersExample(
+        //                 10,
+        //                 listOf("Notary1", "Notary2"),
+        //                 100,
+        //                 10,
+        //                 Instant.now(),
+        //                 9,
+        //                 mapOf("A" to listOf(1, 2, 3), "B" to listOf (4, 5, 6)))).bytes)
+
+        val url = EvolvabilityTests::class.java.getResource(resource)
+        DeserializationInput(factory).deserialize(SerializedBytes<NetworkParametersExample>(url.readBytes()))
     }
 
     @Test(expected = NotSerializableException::class)
@@ -460,5 +555,114 @@ class EvolvabilityTests {
         assertEquals(e, db3.e)
         assertEquals(f, db3.f)
         assertEquals(-1, db3.g)
+    }
+
+    //
+    // This test uses a NetworkParameters signed set of bytes generated by R3 Corda and
+    // is here to ensure we can still read them. This test exists because of the break in
+    // being able to deserialize an object serialized prior to some fixes to the fingerprinter.
+    //
+    // The file itself was generated from R3 Corda at commit
+    //      6a6b6f256 Skip cache invalidation during init() - caches are still null.
+    //
+    // To regenerate the file un-ignore the test below this one (regenerate broken network parameters),
+    // to regenerate at a specific version add that test to a checkout at the desired sha then take
+    // the resulting file and add to the repo, changing the filename as appropriate
+    //
+    @Test
+    @Ignore("Test fails after moving NetworkParameters and NotaryInfo into core from node-api")
+    fun readBrokenNetworkParameters() {
+        val sf = testDefaultFactory()
+        sf.register(net.corda.nodeapi.internal.serialization.amqp.custom.InstantSerializer(sf))
+        sf.register(net.corda.nodeapi.internal.serialization.amqp.custom.PublicKeySerializer)
+
+        //
+        // filename breakdown
+        // networkParams - because this is a serialised set of network parameters
+        // r3corda - generated by R3 Corda instead of Corda
+        // 6a6b6f256 - Commit sha of the build that generated the file we're testing against
+        //
+        val resource = "networkParams.r3corda.6a6b6f256"
+
+        val path = EvolvabilityTests::class.java.getResource(resource)
+        val f = File(path.toURI())
+        val sc2 = f.readBytes()
+        val deserializedC = DeserializationInput(sf).deserialize(SerializedBytes<SignedData<NetworkParameters>>(sc2))
+        val networkParams = DeserializationInput(sf).deserialize(deserializedC.raw)
+
+        assertEquals(1000, networkParams.maxMessageSize)
+        assertEquals(1000, networkParams.maxTransactionSize)
+        assertEquals(3, networkParams.minimumPlatformVersion)
+        assertEquals(1, networkParams.notaries.size)
+        assertEquals(TestIdentity(DUMMY_NOTARY_NAME, 20).party, networkParams.notaries.firstOrNull()?.identity)
+    }
+
+    //
+    // This test created a serialized and signed set of Network Parameters to test whether we
+    // can still deserialize them
+    //
+    @Test
+    @Ignore("This test simply regenerates the test file used for readBrokenNetworkParameters")
+    fun `regenerate broken network parameters`() {
+        // note: 6a6b6f256 is the sha that generates the file
+        val resource = "networkParams.<corda version>.<commit sha>"
+        val DUMMY_NOTARY = TestIdentity(DUMMY_NOTARY_NAME, 20).party
+        val networkParameters = NetworkParameters(
+                3, listOf(NotaryInfo(DUMMY_NOTARY, false)), 1000, 1000, Instant.EPOCH, 1, emptyMap())
+
+        val sf = testDefaultFactory()
+        sf.register(net.corda.nodeapi.internal.serialization.amqp.custom.InstantSerializer(sf))
+        sf.register(net.corda.nodeapi.internal.serialization.amqp.custom.PublicKeySerializer)
+
+        val testOutput = TestSerializationOutput(true, sf)
+        val serialized = testOutput.serialize(networkParameters)
+        val keyPair = generateKeyPair()
+        val sig = keyPair.private.sign(serialized.bytes, keyPair.public)
+        val signed = SignedData(serialized, sig)
+        val signedAndSerialized = testOutput.serialize(signed)
+
+        File(URI("$localPath/$resource")).writeBytes( signedAndSerialized.bytes)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    @Test
+    fun getterSetterEvolver1() {
+        val resource = "EvolvabilityTests.getterSetterEvolver1"
+        val sf = testDefaultFactory()
+
+        //
+        // Class as it was serialised
+        //
+        // data class C(var c: Int, var d: Int, var b: Int, var e: Int, var a: Int) {
+        //     // This will force the serialization engine to use getter / setter
+        //     // instantiation for the object rather than construction
+        //     @ConstructorForDeserialization
+        //     @Suppress("UNUSED")
+        //     constructor() : this(0, 0, 0, 0, 0)
+        // }
+        //
+        // File(URI("$localPath/$resource")).writeBytes(SerializationOutput(sf).serialize(C(3,4,2,5,1)).bytes)
+
+        //
+        // Class as it exists now, c has been removed
+        //
+        data class C(var d: Int, var b: Int, var e: Int, var a: Int) {
+            // This will force the serialization engine to use getter / setter
+            // instantiation for the object rather than construction
+            @ConstructorForDeserialization
+            @Suppress("UNUSED")
+            constructor() : this(0, 0, 0, 0)
+        }
+
+        val path = EvolvabilityTests::class.java.getResource(resource)
+        val f = File(path.toURI())
+
+        val sc2 = f.readBytes()
+        val deserializedC = DeserializationInput(sf).deserialize(SerializedBytes<C>(sc2))
+
+        assertEquals(1, deserializedC.a)
+        assertEquals(2, deserializedC.b)
+        assertEquals(4, deserializedC.d)
+        assertEquals(5, deserializedC.e)
     }
 }

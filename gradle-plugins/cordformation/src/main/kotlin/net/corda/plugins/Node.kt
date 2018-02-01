@@ -3,8 +3,10 @@ package net.corda.plugins
 import com.typesafe.config.ConfigFactory
 import com.typesafe.config.ConfigRenderOptions
 import com.typesafe.config.ConfigValueFactory
+import com.typesafe.config.ConfigObject
 import groovy.lang.Closure
 import net.corda.cordform.CordformNode
+import net.corda.cordform.RpcSettings
 import org.gradle.api.Project
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -34,6 +36,11 @@ class Node(private val project: Project) : CordformNode() {
         private set
     internal lateinit var rootDir: File
         private set
+    internal lateinit var containerName: String
+        private set
+
+    internal var rpcSettings: RpcSettings = RpcSettings()
+        private set
 
     /**
      * Sets whether this node will use HTTPS communication.
@@ -59,7 +66,7 @@ class Node(private val project: Project) : CordformNode() {
      * Specifies RPC settings for the node.
      */
     fun rpcSettings(configureClosure: Closure<in RpcSettings>) {
-        val rpcSettings = project.configure(RpcSettings(project), configureClosure) as RpcSettings
+        rpcSettings = project.configure(RpcSettings(), configureClosure) as RpcSettings
         config = rpcSettings.addTo("rpcSettings", config)
     }
 
@@ -81,6 +88,19 @@ class Node(private val project: Project) : CordformNode() {
         installCordapps()
     }
 
+    internal fun buildDocker() {
+        project.copy {
+            it.apply {
+                from(Cordformation.getPluginFile(project, "net/corda/plugins/Dockerfile"))
+                from(Cordformation.getPluginFile(project, "net/corda/plugins/run-corda.sh"))
+                into("$nodeDir/")
+            }
+        }
+        installAgentJar()
+        installBuiltCordapp()
+        installCordapps()
+    }
+
     internal fun rootDir(rootDir: Path) {
         if (name == null) {
             project.logger.error("Node has a null name - cannot create node")
@@ -90,8 +110,9 @@ class Node(private val project: Project) : CordformNode() {
         // with loading our custom X509EdDSAEngine.
         val organizationName = name.trim().split(",").firstOrNull { it.startsWith("O=") }?.substringAfter("=")
         val dirName = organizationName ?: name
+        containerName = dirName.replace("\\s+".toRegex(), "-").toLowerCase()
         this.rootDir = rootDir.toFile()
-        nodeDir = File(this.rootDir, dirName)
+        nodeDir = File(this.rootDir, dirName.replace("\\s", ""))
         Files.createDirectories(nodeDir.toPath())
     }
 
@@ -137,13 +158,13 @@ class Node(private val project: Project) : CordformNode() {
      */
     private fun installAgentJar() {
         // TODO: improve how we re-use existing declared external variables from root gradle.build
-        val jolokiaVersion = try { project.rootProject.ext<String>("jolokia_version") } catch (e: Exception) { "1.3.7" }
+        val jolokiaVersion = try { project.rootProject.ext<String>("jolokia_version") } catch (e: Exception) { "1.6.0" }
         val agentJar = project.configuration("runtime").files {
             (it.group == "org.jolokia") &&
                     (it.name == "jolokia-jvm") &&
                     (it.version == jolokiaVersion)
             // TODO: revisit when classifier attribute is added. eg && (it.classifier = "agent")
-        }.first()  // should always be the jolokia agent fat jar: eg. jolokia-jvm-1.3.7-agent.jar
+        }.first()  // should always be the jolokia agent fat jar: eg. jolokia-jvm-1.6.0-agent.jar
         project.logger.info("Jolokia agent jar: $agentJar")
         if (agentJar.isFile) {
             val driversDir = File(nodeDir, "drivers")
@@ -156,14 +177,14 @@ class Node(private val project: Project) : CordformNode() {
         }
     }
 
-    private fun createTempConfigFile(): File {
+    private fun createTempConfigFile(configObject: ConfigObject): File {
         val options = ConfigRenderOptions
                 .defaults()
                 .setOriginComments(false)
                 .setComments(false)
                 .setFormatted(true)
                 .setJson(false)
-        val configFileText = config.root().render(options).split("\n").toList()
+        val configFileText = configObject.render(options).split("\n").toList()
         // Need to write a temporary file first to use the project.copy, which resolves directories correctly.
         val tmpDir = File(project.buildDir, "tmp")
         Files.createDirectories(tmpDir.toPath())
@@ -178,7 +199,27 @@ class Node(private val project: Project) : CordformNode() {
      */
     internal fun installConfig() {
         configureProperties()
-        val tmpConfFile = createTempConfigFile()
+        val tmpConfFile = createTempConfigFile(config.root())
+        appendOptionalConfig(tmpConfFile)
+        project.copy {
+            it.apply {
+                from(tmpConfFile)
+                into(rootDir)
+            }
+        }
+    }
+
+    /**
+     * Installs the Dockerized configuration file to the root directory and detokenises it.
+     */
+    internal fun installDockerConfig() {
+        configureProperties()
+        val dockerConf = config
+                .withValue("p2pAddress", ConfigValueFactory.fromAnyRef("$containerName:$p2pPort"))
+                .withValue("rpcSettings.address", ConfigValueFactory.fromAnyRef("$containerName:${rpcSettings.port}"))
+                .withValue("rpcSettings.adminAddress", ConfigValueFactory.fromAnyRef("$containerName:${rpcSettings.adminPort}"))
+                .withValue("detectPublicIp", ConfigValueFactory.fromAnyRef(false))
+        val tmpConfFile = createTempConfigFile(dockerConf.root())
         appendOptionalConfig(tmpConfFile)
         project.copy {
             it.apply {
@@ -227,7 +268,7 @@ class Node(private val project: Project) : CordformNode() {
      *
      * @return List of this node's cordapps.
      */
-    private fun getCordappList(): Collection<File> {
+    fun getCordappList(): Collection<File> {
         // Cordapps can sometimes contain a GString instance which fails the equality test with the Java string
         @Suppress("RemoveRedundantCallsOfConversionMethods")
         val cordapps: List<String> = cordapps.map { it.toString() }

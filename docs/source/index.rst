@@ -1,8 +1,7 @@
 Welcome to Corda !
 ==================
 
-`Corda <https://www.corda.net/>`_ is a blockchain-inspired open source distributed ledger platform. If you’d like a
-quick introduction to distributed ledgers and how Corda is different, then watch this short video:
+`Corda <https://www.corda.net/>`_ is an open-source blockchain platform. If you’d like a quick introduction to blockchains and how Corda is different, then watch this short video:
 
 .. raw:: html
 
@@ -22,8 +21,12 @@ If you have questions or comments, then get in touch on `Slack <https://slack.co
 
 We look forward to seeing what you can do with Corda!
 
+.. note:: You can read this site offline. Either `download the PDF`_ or download the Corda source code, run ``gradle buildDocs`` and you will have
+   a copy of this site in the ``docs/build/html`` directory.
+
 .. _`introductory white paper`: _static/corda-introductory-whitepaper.pdf
 .. _`technical white paper`: _static/corda-technical-whitepaper.pdf
+.. _`download the PDF`: _static/corda-developer-site.pdf
 
 .. toctree::
    :maxdepth: 1
@@ -37,6 +40,7 @@ We look forward to seeing what you can do with Corda!
    tools-index.rst
    node-internals-index.rst
    component-library-index.rst
+   contributing-index.rst
    release-process-index.rst
    faq.rst
    troubleshooting.rst

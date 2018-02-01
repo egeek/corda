@@ -9,6 +9,7 @@ import net.corda.core.crypto.sha256
 import net.corda.core.identity.AbstractParty
 import net.corda.core.identity.AnonymousParty
 import net.corda.core.identity.CordaX500Name
+import net.corda.core.node.services.IdentityService
 import net.corda.core.transactions.TransactionBuilder
 import net.corda.core.utilities.NonEmptySet
 import net.corda.core.utilities.OpaqueBytes
@@ -23,7 +24,9 @@ import net.corda.testing.contracts.DummyContract
 import net.corda.testing.contracts.DummyState
 import net.corda.testing.core.*
 import net.corda.testing.dsl.*
+import net.corda.testing.internal.TEST_TX_TIME
 import net.corda.testing.internal.rigorousMock
+import net.corda.testing.internal.vault.CommodityState
 import net.corda.testing.node.MockServices
 import net.corda.testing.node.ledger
 import net.corda.testing.node.transaction
@@ -78,8 +81,8 @@ class ObligationTests {
             beneficiary = CHARLIE
     )
     private val outState = inState.copy(beneficiary = AnonymousParty(BOB_PUBKEY))
-    private val miniCorpServices = MockServices(listOf("net.corda.finance.contracts.asset"), rigorousMock(), miniCorp)
-    private val notaryServices = MockServices(emptyList(), rigorousMock(), MEGA_CORP.name, dummyNotary.keyPair)
+    private val miniCorpServices = MockServices(listOf("net.corda.finance.contracts.asset"), miniCorp, rigorousMock<IdentityService>())
+    private val notaryServices = MockServices(emptyList(), MEGA_CORP.name, rigorousMock(), dummyNotary.keyPair)
     private val identityService = rigorousMock<IdentityServiceInternal>().also {
         doReturn(null).whenever(it).partyFromKey(ALICE_PUBKEY)
         doReturn(null).whenever(it).partyFromKey(BOB_PUBKEY)
@@ -87,8 +90,8 @@ class ObligationTests {
         doReturn(MEGA_CORP).whenever(it).partyFromKey(MEGA_CORP_PUBKEY)
         doReturn(MINI_CORP).whenever(it).partyFromKey(MINI_CORP_PUBKEY)
     }
-    private val mockService = MockServices(listOf("net.corda.finance.contracts.asset"), identityService, MEGA_CORP.name)
-    private val ledgerServices get() = MockServices(emptyList(), identityService, MEGA_CORP.name)
+    private val mockService = MockServices(listOf("net.corda.finance.contracts.asset"), MEGA_CORP.name, identityService)
+    private val ledgerServices get() = MockServices(listOf("net.corda.finance.contracts.asset", "net.corda.testing.contracts"), MEGA_CORP.name, identityService)
     private fun cashObligationTestRoots(
             group: LedgerDSL<TestTransactionDSLInterpreter, TestLedgerDSLInterpreter>
     ) = group.apply {
@@ -573,15 +576,15 @@ class ObligationTests {
             unverifiedTransaction {
                 attachments(Obligation.PROGRAM_ID)
                 output(Obligation.PROGRAM_ID, "Alice's 1 FCOJ obligation to Bob", oneUnitFcojObligation between Pair(ALICE, BOB))
-                output(Obligation.PROGRAM_ID, "Alice's 1 FCOJ", CommodityContract.State(oneUnitFcoj, ALICE))
+                output(Obligation.PROGRAM_ID, "Alice's 1 FCOJ", CommodityState(oneUnitFcoj, ALICE))
             }
             transaction("Settlement") {
                 attachments(Obligation.PROGRAM_ID)
                 input("Alice's 1 FCOJ obligation to Bob")
                 input("Alice's 1 FCOJ")
-                output(Obligation.PROGRAM_ID, "Bob's 1 FCOJ", CommodityContract.State(oneUnitFcoj, BOB))
+                output(Obligation.PROGRAM_ID, "Bob's 1 FCOJ", CommodityState(oneUnitFcoj, BOB))
                 command(ALICE_PUBKEY, Obligation.Commands.Settle(Amount(oneUnitFcoj.quantity, oneUnitFcojObligation.amount.token)))
-                command(ALICE_PUBKEY, CommodityContract.Commands.Move(Obligation::class.java))
+                command(ALICE_PUBKEY, Obligation.Commands.Move(Obligation::class.java))
                 attachment(attachment(commodityContractBytes.inputStream()))
                 verifies()
             }

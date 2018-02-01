@@ -396,6 +396,130 @@ Providing a public getter, as per the following example, is acceptable:
           }
       }
 
+Mismatched Class Properties / Constructor Parameters
+````````````````````````````````````````````````````
+
+Consider an example where you wish to ensure that a property of class whose type is some form of container is always sorted using some specific criteria yet you wish to maintain the immutability of the class.
+
+This could be codified as follows:
+
+.. container:: codeset
+
+    .. sourcecode:: kotlin
+
+        @CordaSerializable
+        class ConfirmRequest(statesToConsume: List<StateRef>, val transactionId: SecureHash) {
+            companion object {
+                private val stateRefComparator = compareBy<StateRef>({ it.txhash }, { it.index })
+            }
+
+            private val states = statesToConsume.sortedWith(stateRefComparator)
+        }
+
+The intention in the example is to always ensure that the states are stored in a specific order regardless of the ordering
+of the list used to initialise instances of the class. This is achieved by using the first constructor parameter as the
+basis for a private member. However, because that member is not mentioned in the constructor (whose parameters determine
+what is serializable as discussed above) it would not be serialized. In addition, as there is no provided mechanism to retrieve
+a value for ``statesToConsume`` we would fail to build a serializer for this Class.
+
+In this case a secondary constructor annotated with ``@ConstructorForDeserialization`` would not be a valid solution as the
+two signatures would be the same. Best practice is thus to provide a getter for the constructor parameter which explicitly
+associates it with the actual member variable.
+
+.. container:: codeset
+
+    .. sourcecode:: kotlin
+
+        @CordaSerializable
+        class ConfirmRequest(statesToConsume: List<StateRef>, val transactionId: SecureHash) {
+            companion object {
+                private val stateRefComparator = compareBy<StateRef>({ it.txhash }, { it.index })
+            }
+
+            private val states = statesToConsume.sortedWith(stateRefComparator)
+
+            //Explicit "getter" for a property identified from the constructor parameters
+            fun getStatesToConsume() = states
+        }
+
+Mutable Containers
+``````````````````
+
+Because Java fundamentally provides no mechanism by which the mutability of a class can be determined this presents a
+problem for the serialization framework. When reconstituting objects with container properties (lists, maps, etc) we
+must chose whether to create mutable or immutable objects. Given the restrictions, we have decided it is better to
+preserve the immutability of immutable objects rather than force mutability on presumed immutable objects.
+
+.. note:: Whilst we could potentially infer mutability empirically, doing so exhaustively is impossible as it's a design
+  decision rather than something intrinsic to the JVM. At present, we defer to simply making things immutable on reconstruction
+  with the following workarounds provided for those who use them. In future, this may change, but for now use the following
+  examples as a guide.
+
+For example, consider the following:
+
+.. sourcecode:: kotlin
+
+    data class C(val l : MutableList<String>)
+
+    val bytes = C(mutableListOf ("a", "b", "c")).serialize()
+    val newC = bytes.deserialize()
+
+    newC.l.add("d")
+
+The call to ``newC.l.add`` will throw an ``UnsupportedOperationException``.
+
+There are several workarounds that can be used to preserve mutability on reconstituted objects. Firstly, if the class
+isn't a Kotlin data class and thus isn't restricted by having to have a primary constructor.
+
+.. sourcecode:: kotlin
+
+    class C {
+        val l : MutableList<String>
+
+        @Suppress("Unused")
+        constructor (l : MutableList<String>) {
+            this.l = l.toMutableList()
+        }
+    }
+
+    val bytes = C(mutableListOf ("a", "b", "c")).serialize()
+    val newC = bytes.deserialize()
+
+    // This time this call will succeed
+    newC.l.add("d")
+
+Secondly, if the class is a Kotlin data class, a secondary constructor can be used.
+
+.. sourcecode:: kotlin
+
+    data class C (val l : MutableList<String>){
+        @ConstructorForDeserialization
+        @Suppress("Unused")
+        constructor (l : Collection<String>) : this (l.toMutableList())
+    }
+
+    val bytes = C(mutableListOf ("a", "b", "c")).serialize()
+    val newC = bytes.deserialize()
+
+    // This will also work
+    newC.l.add("d")
+
+Thirdly, to preserve immutability of objects (a recommend design principle - Copy on Write semantics) then mutating the
+contents of the class can be done by creating a new copy of the data class with the altered list passed (in this example)
+passed in as the Constructor parameter.
+
+.. sourcecode:: kotlin
+
+    data class C(val l : List<String>)
+
+    val bytes = C(listOf ("a", "b", "c")).serialize()
+    val newC = bytes.deserialize()
+
+    val newC2 = newC.copy (l = (newC.l + "d"))
+
+.. note:: If mutability isn't an issue at all then in the case of data classes a single constructor can
+  be used by making the property var instead of val and in the ``init`` block reassigning the property
+  to a mutable instance
 
 Enums
 `````
@@ -450,6 +574,4 @@ all versions of the class. This ensures an object serialized with an older idea 
 and a version of the current state of the class instantiated.
 
 More detail can be found in :doc:`serialization-default-evolution`.
-
-
 

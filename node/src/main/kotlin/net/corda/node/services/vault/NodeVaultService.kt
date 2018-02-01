@@ -6,17 +6,17 @@ import net.corda.core.contracts.*
 import net.corda.core.crypto.SecureHash
 import net.corda.core.internal.*
 import net.corda.core.messaging.DataFeed
-import net.corda.core.node.StateLoader
+import net.corda.core.node.ServicesForResolution
 import net.corda.core.node.StatesToRecord
 import net.corda.core.node.services.*
 import net.corda.core.node.services.vault.*
 import net.corda.core.schemas.PersistentStateRef
 import net.corda.core.serialization.SingletonSerializeAsToken
-import net.corda.core.transactions.CoreTransaction
-import net.corda.core.transactions.NotaryChangeWireTransaction
-import net.corda.core.transactions.WireTransaction
+import net.corda.core.transactions.*
 import net.corda.core.utilities.*
+import net.corda.node.services.api.SchemaService
 import net.corda.node.services.api.VaultServiceInternal
+import net.corda.node.services.schema.PersistentStateService
 import net.corda.node.services.statemachine.FlowStateMachineImpl
 import net.corda.nodeapi.internal.persistence.*
 import org.hibernate.Session
@@ -49,8 +49,9 @@ private fun CriteriaBuilder.executeUpdate(session: Session, configure: Root<*>.(
 class NodeVaultService(
         private val clock: Clock,
         private val keyManagementService: KeyManagementService,
-        private val stateLoader: StateLoader,
-        hibernateConfig: HibernateConfiguration
+        private val servicesForResolution: ServicesForResolution,
+        private val hibernateConfig: HibernateConfiguration,
+        private val schemaService: SchemaService
 ) : SingletonSerializeAsToken(), VaultServiceInternal {
     private companion object {
         private val log = contextLogger()
@@ -66,6 +67,7 @@ class NodeVaultService(
     }
 
     private val mutex = ThreadBox(InnerState())
+    private val persistentStateService = PersistentStateService(schemaService)
 
     private fun recordUpdate(update: Vault.Update<ContractState>): Vault.Update<ContractState> {
         if (!update.isEmpty()) {
@@ -108,46 +110,34 @@ class NodeVaultService(
     override val updates: Observable<Vault.Update<ContractState>>
         get() = mutex.locked { _updatesInDbTx }
 
+    /** Groups adjacent transactions into batches to generate separate net updates per transaction type. */
     override fun notifyAll(statesToRecord: StatesToRecord, txns: Iterable<CoreTransaction>) {
-        if (statesToRecord == StatesToRecord.NONE)
-            return
+        if (statesToRecord == StatesToRecord.NONE || !txns.any()) return
+        val batch = mutableListOf<CoreTransaction>()
 
-        // It'd be easier to just group by type, but then we'd lose ordering.
-        val regularTxns = mutableListOf<WireTransaction>()
-        val notaryChangeTxns = mutableListOf<NotaryChangeWireTransaction>()
-
-        for (tx in txns) {
-            when (tx) {
-                is WireTransaction -> {
-                    regularTxns.add(tx)
-                    if (notaryChangeTxns.isNotEmpty()) {
-                        notifyNotaryChange(notaryChangeTxns.toList(), statesToRecord)
-                        notaryChangeTxns.clear()
-                    }
-                }
-                is NotaryChangeWireTransaction -> {
-                    notaryChangeTxns.add(tx)
-                    if (regularTxns.isNotEmpty()) {
-                        notifyRegular(regularTxns.toList(), statesToRecord)
-                        regularTxns.clear()
-                    }
-                }
-            }
+        fun flushBatch() {
+            val updates = makeUpdates(batch, statesToRecord)
+            processAndNotify(updates)
+            batch.clear()
         }
 
-        if (regularTxns.isNotEmpty()) notifyRegular(regularTxns.toList(), statesToRecord)
-        if (notaryChangeTxns.isNotEmpty()) notifyNotaryChange(notaryChangeTxns.toList(), statesToRecord)
+        for (tx in txns) {
+            if (batch.isNotEmpty() && tx.javaClass != batch.last().javaClass) {
+                flushBatch()
+            }
+            batch.add(tx)
+        }
+        flushBatch()
     }
 
-    private fun notifyRegular(txns: Iterable<WireTransaction>, statesToRecord: StatesToRecord) {
-        fun makeUpdate(tx: WireTransaction): Vault.Update<ContractState> {
+    private fun makeUpdates(batch: Iterable<CoreTransaction>, statesToRecord: StatesToRecord): List<Vault.Update<ContractState>> {
+        fun makeUpdate(tx: WireTransaction): Vault.Update<ContractState>? {
             val myKeys = keyManagementService.filterMyKeys(tx.outputs.flatMap { it.data.participants.map { it.owningKey } })
-
             val ourNewStates = when (statesToRecord) {
                 StatesToRecord.NONE -> throw AssertionError("Should not reach here")
-                StatesToRecord.ONLY_RELEVANT -> tx.outputs.filter { isRelevant(it.data, myKeys.toSet()) }
-                StatesToRecord.ALL_VISIBLE -> tx.outputs
-            }.map { tx.outRef<ContractState>(it.data) }
+                StatesToRecord.ONLY_RELEVANT -> tx.outputs.withIndex().filter { isRelevant(it.value.data, myKeys.toSet()) }
+                StatesToRecord.ALL_VISIBLE -> tx.outputs.withIndex()
+            }.map { tx.outRef<ContractState>(it.index) }
 
             // Retrieve all unconsumed states for this transaction's inputs
             val consumedStates = loadStates(tx.inputs)
@@ -155,60 +145,75 @@ class NodeVaultService(
             // Is transaction irrelevant?
             if (consumedStates.isEmpty() && ourNewStates.isEmpty()) {
                 log.trace { "tx ${tx.id} was irrelevant to this vault, ignoring" }
-                return Vault.NoUpdate
+                return null
             }
 
             return Vault.Update(consumedStates.toSet(), ourNewStates.toSet())
         }
 
-        val netDelta = txns.fold(Vault.NoUpdate) { netDelta, txn -> netDelta + makeUpdate(txn) }
-        processAndNotify(netDelta)
-    }
-
-    private fun notifyNotaryChange(txns: Iterable<NotaryChangeWireTransaction>, statesToRecord: StatesToRecord) {
-        fun makeUpdate(tx: NotaryChangeWireTransaction): Vault.Update<ContractState> {
+        fun resolveAndMakeUpdate(tx: CoreTransaction): Vault.Update<ContractState>? {
             // We need to resolve the full transaction here because outputs are calculated from inputs
-            // We also can't do filtering beforehand, since output encumbrance pointers get recalculated based on
-            // input positions
-            val ltx = tx.resolve(stateLoader, emptyList())
+            // We also can't do filtering beforehand, since for notary change transactions output encumbrance pointers
+            // get recalculated based on input positions.
+            val ltx: FullTransaction = when (tx) {
+                is NotaryChangeWireTransaction -> tx.resolve(servicesForResolution, emptyList())
+                is ContractUpgradeWireTransaction -> tx.resolve(servicesForResolution, emptyList())
+                else -> throw IllegalArgumentException("Unsupported transaction type: ${tx.javaClass.name}")
+            }
             val myKeys = keyManagementService.filterMyKeys(ltx.outputs.flatMap { it.data.participants.map { it.owningKey } })
             val (consumedStateAndRefs, producedStates) = ltx.inputs.
                     zip(ltx.outputs).
                     filter { (_, output) ->
-                        if (statesToRecord == StatesToRecord.ONLY_RELEVANT)
-                            isRelevant(output.data, myKeys.toSet())
-                        else
-                            true
+                        if (statesToRecord == StatesToRecord.ONLY_RELEVANT) isRelevant(output.data, myKeys.toSet())
+                        else true
                     }.
                     unzip()
 
             val producedStateAndRefs = producedStates.map { ltx.outRef<ContractState>(it.data) }
-
             if (consumedStateAndRefs.isEmpty() && producedStateAndRefs.isEmpty()) {
                 log.trace { "tx ${tx.id} was irrelevant to this vault, ignoring" }
-                return Vault.NoNotaryUpdate
+                return null
             }
 
-            return Vault.Update(consumedStateAndRefs.toHashSet(), producedStateAndRefs.toHashSet(), null, Vault.UpdateType.NOTARY_CHANGE)
+            val updateType = if (tx is ContractUpgradeWireTransaction) {
+                Vault.UpdateType.CONTRACT_UPGRADE
+            } else {
+                Vault.UpdateType.NOTARY_CHANGE
+            }
+            return Vault.Update(consumedStateAndRefs.toSet(), producedStateAndRefs.toSet(), null, updateType)
         }
 
-        val netDelta = txns.fold(Vault.NoNotaryUpdate) { netDelta, txn -> netDelta + makeUpdate(txn) }
-        processAndNotify(netDelta)
+
+        return batch.mapNotNull {
+            if (it is WireTransaction) makeUpdate(it) else resolveAndMakeUpdate(it)
+        }
     }
 
     private fun loadStates(refs: Collection<StateRef>): Collection<StateAndRef<ContractState>> {
-        return if (refs.isNotEmpty())
-            queryBy<ContractState>(QueryCriteria.VaultQueryCriteria(stateRefs = refs.toList())).states
-        else emptySet()
+        val states = mutableListOf<StateAndRef<ContractState>>()
+        if (refs.isNotEmpty()) {
+            val refsList = refs.toList()
+            val pageSize = PageSpecification().pageSize
+            (0..refsList.size / pageSize).forEach {
+                val offset = it * pageSize
+                val limit = minOf(offset + pageSize, refsList.size)
+                val page = queryBy<ContractState>(QueryCriteria.VaultQueryCriteria(stateRefs = refsList.subList(offset, limit))).states
+                states.addAll(page)
+            }
+        }
+        return states
     }
 
-    private fun processAndNotify(update: Vault.Update<ContractState>) {
-        if (!update.isEmpty()) {
-            recordUpdate(update)
+    private fun processAndNotify(updates: List<Vault.Update<ContractState>>) {
+        if (updates.isEmpty()) return
+        val netUpdate = updates.reduce { update1, update2 -> update1 + update2 }
+        if (!netUpdate.isEmpty()) {
+            recordUpdate(netUpdate)
             mutex.locked {
                 // flowId required by SoftLockManager to perform auto-registration of soft locks for new states
                 val uuid = (Strand.currentStrand() as? FlowStateMachineImpl<*>)?.id?.uuid
-                val vaultUpdate = if (uuid != null) update.copy(flowId = uuid) else update
+                val vaultUpdate = if (uuid != null) netUpdate.copy(flowId = uuid) else netUpdate
+                persistentStateService.persist(vaultUpdate.produced)
                 updatesPublisher.onNext(vaultUpdate)
             }
         }
@@ -366,17 +371,18 @@ class NodeVaultService(
      * Maintain a list of contract state interfaces to concrete types stored in the vault
      * for usage in generic queries of type queryBy<LinearState> or queryBy<FungibleState<*>>
      */
-    private val contractStateTypeMappings = bootstrapContractStateTypes()
+    private val contractStateTypeMappings = mutableMapOf<String, MutableSet<String>>()
 
     init {
+        bootstrapContractStateTypes()
         rawUpdates.subscribe { update ->
             update.produced.forEach {
                 val concreteType = it.state.data.javaClass
                 log.trace { "State update of type: $concreteType" }
                 val seen = contractStateTypeMappings.any { it.value.contains(concreteType.name) }
                 if (!seen) {
-                    val contractInterfaces = deriveContractInterfaces(concreteType)
-                    contractInterfaces.map {
+                    val contractStateTypes = deriveContractTypes(concreteType)
+                    contractStateTypes.map {
                         val contractInterface = contractStateTypeMappings.getOrPut(it.name, { mutableSetOf() })
                         contractInterface.add(concreteType.name)
                     }
@@ -405,65 +411,60 @@ class NodeVaultService(
         // TODO: revisit (use single instance of parser for all queries)
         val criteriaParser = HibernateQueryCriteriaParser(contractStateType, contractStateTypeMappings, criteriaBuilder, criteriaQuery, queryRootVaultStates)
 
-        try {
-            // parse criteria and build where predicates
-            criteriaParser.parse(criteria, sorting)
+        // parse criteria and build where predicates
+        criteriaParser.parse(criteria, sorting)
 
-            // prepare query for execution
-            val query = session.createQuery(criteriaQuery)
+        // prepare query for execution
+        val query = session.createQuery(criteriaQuery)
 
-            // pagination checks
-            if (!paging.isDefault) {
-                // pagination
-                if (paging.pageNumber < DEFAULT_PAGE_NUM) throw VaultQueryException("Page specification: invalid page number ${paging.pageNumber} [page numbers start from $DEFAULT_PAGE_NUM]")
-                if (paging.pageSize < 1) throw VaultQueryException("Page specification: invalid page size ${paging.pageSize} [must be a value between 1 and $MAX_PAGE_SIZE]")
-            }
-
-            query.firstResult = (paging.pageNumber - 1) * paging.pageSize
-            query.maxResults = paging.pageSize + 1  // detection too many results
-
-            // execution
-            val results = query.resultList
-
-            // final pagination check (fail-fast on too many results when no pagination specified)
-            if (paging.isDefault && results.size > DEFAULT_PAGE_SIZE)
-                throw VaultQueryException("Please specify a `PageSpecification` as there are more results [${results.size}] than the default page size [$DEFAULT_PAGE_SIZE]")
-
-            val statesAndRefs: MutableList<StateAndRef<T>> = mutableListOf()
-            val statesMeta: MutableList<Vault.StateMetadata> = mutableListOf()
-            val otherResults: MutableList<Any> = mutableListOf()
-            val stateRefs = mutableSetOf<StateRef>()
-
-            results.asSequence()
-                    .forEachIndexed { index, result ->
-                        if (result[0] is VaultSchemaV1.VaultStates) {
-                            if (!paging.isDefault && index == paging.pageSize) // skip last result if paged
-                                return@forEachIndexed
-                            val vaultState = result[0] as VaultSchemaV1.VaultStates
-                            val stateRef = StateRef(SecureHash.parse(vaultState.stateRef!!.txId!!), vaultState.stateRef!!.index!!)
-                            stateRefs.add(stateRef)
-                            statesMeta.add(Vault.StateMetadata(stateRef,
-                                    vaultState.contractStateClassName,
-                                    vaultState.recordedTime,
-                                    vaultState.consumedTime,
-                                    vaultState.stateStatus,
-                                    vaultState.notary,
-                                    vaultState.lockId,
-                                    vaultState.lockUpdateTime))
-                        } else {
-                            // TODO: improve typing of returned other results
-                            log.debug { "OtherResults: ${Arrays.toString(result.toArray())}" }
-                            otherResults.addAll(result.toArray().asList())
-                        }
-                    }
-            if (stateRefs.isNotEmpty())
-                statesAndRefs.addAll(stateLoader.loadStates(stateRefs) as Collection<StateAndRef<T>>)
-
-            return Vault.Page(states = statesAndRefs, statesMetadata = statesMeta, stateTypes = criteriaParser.stateTypes, totalStatesAvailable = totalStates, otherResults = otherResults)
-        } catch (e: java.lang.Exception) {
-            log.error(e.message)
-            throw e.cause ?: e
+        // pagination checks
+        if (!paging.isDefault) {
+            // pagination
+            if (paging.pageNumber < DEFAULT_PAGE_NUM) throw VaultQueryException("Page specification: invalid page number ${paging.pageNumber} [page numbers start from $DEFAULT_PAGE_NUM]")
+            if (paging.pageSize < 1) throw VaultQueryException("Page specification: invalid page size ${paging.pageSize} [must be a value between 1 and $MAX_PAGE_SIZE]")
         }
+
+        query.firstResult = (paging.pageNumber - 1) * paging.pageSize
+        query.maxResults = paging.pageSize + 1  // detection too many results
+
+        // execution
+        val results = query.resultList
+
+        // final pagination check (fail-fast on too many results when no pagination specified)
+        if (paging.isDefault && results.size > DEFAULT_PAGE_SIZE)
+            throw VaultQueryException("Please specify a `PageSpecification` as there are more results [${results.size}] than the default page size [$DEFAULT_PAGE_SIZE]")
+
+        val statesAndRefs: MutableList<StateAndRef<T>> = mutableListOf()
+        val statesMeta: MutableList<Vault.StateMetadata> = mutableListOf()
+        val otherResults: MutableList<Any> = mutableListOf()
+        val stateRefs = mutableSetOf<StateRef>()
+
+        results.asSequence()
+                .forEachIndexed { index, result ->
+                    if (result[0] is VaultSchemaV1.VaultStates) {
+                        if (!paging.isDefault && index == paging.pageSize) // skip last result if paged
+                            return@forEachIndexed
+                        val vaultState = result[0] as VaultSchemaV1.VaultStates
+                        val stateRef = StateRef(SecureHash.parse(vaultState.stateRef!!.txId!!), vaultState.stateRef!!.index!!)
+                        stateRefs.add(stateRef)
+                        statesMeta.add(Vault.StateMetadata(stateRef,
+                                vaultState.contractStateClassName,
+                                vaultState.recordedTime,
+                                vaultState.consumedTime,
+                                vaultState.stateStatus,
+                                vaultState.notary,
+                                vaultState.lockId,
+                                vaultState.lockUpdateTime))
+                    } else {
+                        // TODO: improve typing of returned other results
+                        log.debug { "OtherResults: ${Arrays.toString(result.toArray())}" }
+                        otherResults.addAll(result.toArray().asList())
+                    }
+                }
+        if (stateRefs.isNotEmpty())
+            statesAndRefs.addAll(servicesForResolution.loadStates(stateRefs) as Collection<StateAndRef<T>>)
+
+        return Vault.Page(states = statesAndRefs, statesMetadata = statesMeta, stateTypes = criteriaParser.stateTypes, totalStatesAvailable = totalStates, otherResults = otherResults)
     }
 
     @Throws(VaultQueryException::class)
@@ -479,7 +480,7 @@ class NodeVaultService(
     /**
      * Derive list from existing vault states and then incrementally update using vault observables
      */
-    private fun bootstrapContractStateTypes(): MutableMap<String, MutableSet<String>> {
+    private fun bootstrapContractStateTypes() {
         val criteria = criteriaBuilder.createQuery(String::class.java)
         val vaultStates = criteria.from(VaultSchemaV1.VaultStates::class.java)
         criteria.select(vaultStates.get("contractStateClassName")).distinct(true)
@@ -490,25 +491,36 @@ class NodeVaultService(
         val distinctTypes = results.map { it }
 
         val contractInterfaceToConcreteTypes = mutableMapOf<String, MutableSet<String>>()
-        distinctTypes.forEach { type ->
+        val unknownTypes = mutableSetOf<String>()
+        distinctTypes.forEach { type ->                           
             val concreteType: Class<ContractState> = uncheckedCast(Class.forName(type))
-            val contractInterfaces = deriveContractInterfaces(concreteType)
-            contractInterfaces.map {
-                val contractInterface = contractInterfaceToConcreteTypes.getOrPut(it.name, { mutableSetOf() })
-                contractInterface.add(concreteType.name)
+            concreteType?.let {
+                val contractTypes = deriveContractTypes(it)
+                contractTypes.map {
+                    val contractStateType = contractStateTypeMappings.getOrPut(it.name) { mutableSetOf() }
+                    contractStateType.add(it.name)
+                }
             }
         }
-        return contractInterfaceToConcreteTypes
+        if (unknownTypes.isNotEmpty()) {
+            log.warn("There are unknown contract state types in the vault, which will prevent these states from being used. The relevant CorDapps must be loaded for these states to be used. The types not on the classpath are ${unknownTypes.joinToString(", ", "[", "]")}.")
+        }
     }
 
-    private fun <T : ContractState> deriveContractInterfaces(clazz: Class<T>): Set<Class<T>> {
-        val myInterfaces: MutableSet<Class<T>> = mutableSetOf()
-        clazz.interfaces.forEach {
-            if (it != ContractState::class.java) {
-                myInterfaces.add(uncheckedCast(it))
-                myInterfaces.addAll(deriveContractInterfaces(uncheckedCast(it)))
+    private fun <T : ContractState> deriveContractTypes(clazz: Class<T>): Set<Class<T>> {
+        val myTypes : MutableSet<Class<T>> = mutableSetOf()
+        clazz.superclass?.let {
+            if (!it.isInstance(Any::class)) {
+                myTypes.add(uncheckedCast(it))
+                myTypes.addAll(deriveContractTypes(uncheckedCast(it)))
             }
         }
-        return myInterfaces
+        clazz.interfaces.forEach {
+            if (it != ContractState::class.java) {
+                myTypes.add(uncheckedCast(it))
+                myTypes.addAll(deriveContractTypes(uncheckedCast(it)))
+            }
+        }
+        return myTypes
     }
 }

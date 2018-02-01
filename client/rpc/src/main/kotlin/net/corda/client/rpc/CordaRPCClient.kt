@@ -66,15 +66,32 @@ data class CordaRPCClientConfiguration(val connectionMaxRetryInterval: Duration)
  * with an error, the observable is closed and you can't then re-subscribe again: you'll have to re-request a fresh
  * observable with another RPC.
  *
+ * In case of loss of connection to the server, the client will try to reconnect using the settings provided via
+ * [CordaRPCClientConfiguration]. While attempting failover, current and future RPC calls will throw
+ * [RPCException] and previously returned observables will call onError().
+ *
  * @param hostAndPort The network address to connect to.
  * @param configuration An optional configuration used to tweak client behaviour.
  * @param sslConfiguration An optional [SSLConfiguration] used to enable secure communication with the server.
  */
-class CordaRPCClient @JvmOverloads constructor(
+class CordaRPCClient private constructor(
         hostAndPort: NetworkHostAndPort,
         configuration: CordaRPCClientConfiguration = CordaRPCClientConfiguration.DEFAULT,
         sslConfiguration: SSLConfiguration? = null
 ) {
+    @JvmOverloads
+    constructor(hostAndPort: NetworkHostAndPort, configuration: CordaRPCClientConfiguration = CordaRPCClientConfiguration.DEFAULT) : this(hostAndPort, configuration, null)
+
+    companion object {
+        internal fun createWithSsl(
+                hostAndPort: NetworkHostAndPort,
+                configuration: CordaRPCClientConfiguration = CordaRPCClientConfiguration.DEFAULT,
+                sslConfiguration: SSLConfiguration? = null
+        ): CordaRPCClient {
+            return CordaRPCClient(hostAndPort, configuration, sslConfiguration)
+        }
+    }
+
     init {
         try {
             effectiveSerializationEnv

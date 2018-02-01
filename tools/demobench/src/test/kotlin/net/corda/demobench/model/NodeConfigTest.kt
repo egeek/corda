@@ -28,6 +28,7 @@ class NodeConfigTest {
                 legalName = myLegalName,
                 p2pPort = 10001,
                 rpcPort = 40002,
+                rpcAdminPort = 40003,
                 webPort = 20001,
                 h2port = 30001,
                 notary = NotaryService(validating = false),
@@ -55,6 +56,7 @@ class NodeConfigTest {
                 legalName = myLegalName,
                 p2pPort = 10001,
                 rpcPort = 40002,
+                rpcAdminPort = 40003,
                 webPort = 20001,
                 h2port = 30001,
                 notary = NotaryService(validating = false),
@@ -77,6 +79,7 @@ class NodeConfigTest {
             legalName: CordaX500Name = CordaX500Name(organisation = "Unknown", locality = "Nowhere", country = "GB"),
             p2pPort: Int = -1,
             rpcPort: Int = -1,
+            rpcAdminPort: Int = -1,
             webPort: Int = -1,
             h2port: Int = -1,
             notary: NotaryService?,
@@ -85,7 +88,10 @@ class NodeConfigTest {
         return NodeConfig(
                 myLegalName = legalName,
                 p2pAddress = localPort(p2pPort),
-                rpcAddress = localPort(rpcPort),
+                rpcSettings = NodeRpcSettings(
+                        address = localPort(rpcPort),
+                        adminAddress = localPort(rpcAdminPort)
+                ),
                 webAddress = localPort(webPort),
                 h2port = h2port,
                 notary = notary,

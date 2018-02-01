@@ -16,12 +16,13 @@ import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_CLIENT_CA
 import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_INTERMEDIATE_CA
 import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_ROOT_CA
 import net.corda.testing.common.internal.testNetworkParameters
-import net.corda.testing.core.DEV_ROOT_CA
 import net.corda.testing.core.SerializationEnvironmentRule
 import net.corda.testing.core.singleIdentity
 import net.corda.testing.driver.PortAllocation
+import net.corda.testing.internal.DEV_ROOT_CA
 import net.corda.testing.node.NotarySpec
 import net.corda.testing.node.internal.CompatibilityZoneParams
+import net.corda.testing.node.internal.SharedCompatibilityZoneParams
 import net.corda.testing.node.internal.internalDriver
 import net.corda.testing.node.internal.network.NetworkMapServer
 import org.assertj.core.api.Assertions.assertThat
@@ -77,7 +78,7 @@ class NodeRegistrationTest {
 
     @Test
     fun `node registration correct root cert`() {
-        val compatibilityZone = CompatibilityZoneParams(
+        val compatibilityZone = SharedCompatibilityZoneParams(
                 URL("http://$serverHostAndPort"),
                 publishNotaries = { server.networkParameters = testNetworkParameters(it) },
                 rootCert = DEV_ROOT_CA.certificate)

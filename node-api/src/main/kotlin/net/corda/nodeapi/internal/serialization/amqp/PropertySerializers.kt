@@ -14,6 +14,9 @@ abstract class PropertyReader {
     abstract fun isNullable(): Boolean
 }
 
+/**
+ * Accessor for those properties of a class that have defined getter functions.
+ */
 class PublicPropertyReader(private val readMethod: Method?) : PropertyReader() {
     init {
         readMethod?.isAccessible = true
@@ -31,7 +34,13 @@ class PublicPropertyReader(private val readMethod: Method?) : PropertyReader() {
             // is: https://youtrack.jetbrains.com/issue/KT-13077
             // TODO: Revisit this when Kotlin issue is fixed.
 
-            loggerFor<PropertySerializer>().error("Unexpected internal Kotlin error", e)
+            // So this used to report as an error, but given we serialise exceptions all the time it
+            // provides for very scary log files so move this to trace level
+            loggerFor<PropertySerializer>().let { logger ->
+                logger.trace("Using kotlin introspection on internal type ${this.declaringClass}")
+                logger.trace("Unexpected internal Kotlin error", e)
+            }
+
             return true
         }
     }
@@ -43,6 +52,10 @@ class PublicPropertyReader(private val readMethod: Method?) : PropertyReader() {
     override fun isNullable(): Boolean = readMethod?.returnsNullable() ?: false
 }
 
+/**
+ * Accessor for those properties of a class that do not have defined getter functions. In which case
+ * we used reflection to remove the unreadable status from that property whilst it's accessed.
+ */
 class PrivatePropertyReader(val field: Field, parentType: Type) : PropertyReader() {
     init {
         loggerFor<PropertySerializer>().warn("Create property Serializer for private property '${field.name}' not "
@@ -63,9 +76,29 @@ class PrivatePropertyReader(val field: Field, parentType: Type) : PropertyReader
         // This might happen for some types, e.g. kotlin.Throwable? - the root cause of the issue
         // is: https://youtrack.jetbrains.com/issue/KT-13077
         // TODO: Revisit this when Kotlin issue is fixed.
-        loggerFor<PropertySerializer>().error("Unexpected internal Kotlin error", e)
+
+        // So this used to report as an error, but given we serialise exceptions all the time it
+        // provides for very scary log files so move this to trace level
+        loggerFor<PropertySerializer>().let { logger ->
+            logger.trace("Using kotlin introspection on internal type $field")
+            logger.trace("Unexpected internal Kotlin error", e)
+        }
         true
     }
+}
+
+/**
+ * Special instance of a [PropertyReader] for use only by [EvolutionSerializer]s to make
+ * it explicit that no properties are ever actually read from an object as the evolution
+ * serializer should only be accessing the already serialized form.
+ */
+class EvolutionPropertyReader : PropertyReader() {
+    override fun read(obj: Any?): Any? {
+        throw UnsupportedOperationException("It should be impossible for an evolution serializer to "
+                + "be reading from an object")
+    }
+
+    override fun isNullable() = true
 }
 
 /**
@@ -102,12 +135,18 @@ abstract class PropertyAccessor(
 class PropertyAccessorGetterSetter(
         initialPosition: Int,
         getter: PropertySerializer,
-        private val setter: Method?) : PropertyAccessor(initialPosition, getter) {
+        private val setter: Method) : PropertyAccessor(initialPosition, getter) {
+    init {
+        /**
+         * Play nicely with Java interop, public methods aren't marked as accessible
+         */
+        setter.isAccessible = true
+    }
     /**
      * Invokes the setter on the underlying object passing in the serialized value.
      */
     override fun set(instance: Any, obj: Any?) {
-        setter?.invoke(instance, *listOf(obj).toTypedArray())
+        setter.invoke(instance, *listOf(obj).toTypedArray())
     }
 }
 

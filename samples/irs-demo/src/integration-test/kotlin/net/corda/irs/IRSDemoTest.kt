@@ -15,18 +15,19 @@ import net.corda.core.identity.CordaX500Name
 import net.corda.core.identity.Party
 import net.corda.core.messaging.vaultTrackBy
 import net.corda.core.toFuture
+import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.core.utilities.contextLogger
 import net.corda.core.utilities.getOrThrow
 import net.corda.core.utilities.seconds
 import net.corda.finance.plugin.registerFinanceJSONMappers
 import net.corda.irs.contract.InterestRateSwap
 import net.corda.irs.web.IrsDemoWebApplication
-import net.corda.node.services.config.NodeConfiguration
 import net.corda.test.spring.springDriver
 import net.corda.testing.core.DUMMY_BANK_A_NAME
 import net.corda.testing.core.DUMMY_BANK_B_NAME
 import net.corda.testing.core.DUMMY_NOTARY_NAME
-import net.corda.testing.core.chooseIdentity
+import net.corda.testing.core.singleIdentity
+import net.corda.testing.driver.DriverParameters
 import net.corda.testing.http.HttpApi
 import net.corda.testing.node.NotarySpec
 import net.corda.testing.node.User
@@ -49,12 +50,12 @@ class IRSDemoTest {
 
     @Test
     fun `runs IRS demo`() {
-        springDriver(
+        springDriver(DriverParameters(
                 useTestClock = true,
                 notarySpecs = listOf(NotarySpec(DUMMY_NOTARY_NAME, rpcUsers = rpcUsers)),
                 isDebug = true,
                 extraCordappPackagesToScan = listOf("net.corda.irs")
-        ) {
+        )) {
             val (nodeA, nodeB) = listOf(
                     startNode(providedName = DUMMY_BANK_A_NAME, rpcUsers = rpcUsers),
                     startNode(providedName = DUMMY_BANK_B_NAME, rpcUsers = rpcUsers),
@@ -78,12 +79,12 @@ class IRSDemoTest {
                 registerIRSModule(mapper)
                 HttpApi.fromHostAndPort(it.second, "api/irs", mapper = mapper)
             }
-            val nextFixingDates = getFixingDateObservable(nodeA.configuration)
+            val nextFixingDates = getFixingDateObservable(nodeA.rpcAddress)
             val numADeals = getTradeCount(nodeAApi)
             val numBDeals = getTradeCount(nodeBApi)
 
             runUploadRates(controllerApi)
-            runTrade(nodeAApi, controller.nodeInfo.chooseIdentity())
+            runTrade(nodeAApi, controller.nodeInfo.singleIdentity())
 
             assertThat(getTradeCount(nodeAApi)).isEqualTo(numADeals + 1)
             assertThat(getTradeCount(nodeBApi)).isEqualTo(numBDeals + 1)
@@ -102,8 +103,8 @@ class IRSDemoTest {
         return getTrades(nodeApi)[0].calculation.floatingLegPaymentSchedule.count { it.value.rate.ratioUnit != null }
     }
 
-    private fun getFixingDateObservable(config: NodeConfiguration): Observable<LocalDate?> {
-        val client = CordaRPCClient(config.rpcOptions.address!!)
+    private fun getFixingDateObservable(address: NetworkHostAndPort): Observable<LocalDate?> {
+        val client = CordaRPCClient(address)
         val proxy = client.start("user", "password").proxy
         val vaultUpdates = proxy.vaultTrackBy<InterestRateSwap.State>().updates
 

@@ -7,6 +7,8 @@ import net.corda.core.serialization.ClassWhitelist
 import net.corda.nodeapi.internal.serialization.carpenter.CarpenterMetaSchema
 import net.corda.nodeapi.internal.serialization.carpenter.ClassCarpenter
 import net.corda.nodeapi.internal.serialization.carpenter.MetaCarpenter
+import net.corda.core.utilities.debug
+import net.corda.core.utilities.loggerFor
 import org.apache.qpid.proton.amqp.*
 import java.io.NotSerializableException
 import java.lang.reflect.*
@@ -38,9 +40,10 @@ data class FactorySchemaAndDescriptor(val schemas: SerializationSchemas, val typ
 // TODO: need to support super classes as well as interfaces with our current code base... what's involved?  If we continue to ban, what is the impact?
 @ThreadSafe
 open class SerializerFactory(
-        val whitelist: ClassWhitelist,
-        cl: ClassLoader,
-        private val evolutionSerializerGetter: EvolutionSerializerGetterBase = EvolutionSerializerGetter()) {
+    val whitelist: ClassWhitelist,
+    cl: ClassLoader,
+    private val evolutionSerializerGetter: EvolutionSerializerGetterBase = EvolutionSerializerGetter()
+) {
     private val serializersByType = ConcurrentHashMap<Type, AMQPSerializer<Any>>()
     private val serializersByDescriptor = ConcurrentHashMap<Any, AMQPSerializer<Any>>()
     private val customSerializers = CopyOnWriteArrayList<SerializerFor>()
@@ -58,6 +61,8 @@ open class SerializerFactory(
     fun getSerializersByDescriptor() = serializersByDescriptor
 
     fun getTransformsCache() = transformsCache
+
+    private val logger by lazy { loggerFor<SerializerFactory>() }
 
     /**
      * Look up, and manufacture if necessary, a serializer for the given type.
@@ -112,7 +117,7 @@ open class SerializerFactory(
      */
     // TODO: test GenericArrayType
     private fun inferTypeVariables(actualClass: Class<*>?, declaredClass: Class<*>,
-                                   declaredType: Type) : Type? = when (declaredType) {
+                                   declaredType: Type): Type? = when (declaredType) {
         is ParameterizedType -> inferTypeVariables(actualClass, declaredClass, declaredType)
     // Nothing to infer, otherwise we'd have ParameterizedType
         is Class<*> -> actualClass
@@ -216,9 +221,9 @@ open class SerializerFactory(
     private fun processSchema(schemaAndDescriptor: FactorySchemaAndDescriptor, sentinel: Boolean = false) {
         val metaSchema = CarpenterMetaSchema.newInstance()
         for (typeNotation in schemaAndDescriptor.schemas.schema.types) {
+            logger.debug { "descriptor=${schemaAndDescriptor.typeDescriptor}, typeNotation=${typeNotation.name}" }
             try {
                 val serialiser = processSchemaEntry(typeNotation)
-
                 // if we just successfully built a serializer for the type but the type fingerprint
                 // doesn't match that of the serialised object then we are dealing with  different
                 // instance of the class, as such we need to build an EvolutionSerializer
@@ -262,12 +267,15 @@ open class SerializerFactory(
                     // Don't need to check the whitelist since each element will come back through the whitelisting process.
                     if (clazz.componentType.isPrimitive) PrimArraySerializer.make(type, this)
                     else ArraySerializer.make(type, this)
-                } else if (clazz.kotlin.objectInstance != null) {
-                    whitelist.requireWhitelisted(clazz)
-                    SingletonSerializer(clazz, clazz.kotlin.objectInstance!!, this)
                 } else {
-                    whitelist.requireWhitelisted(type)
-                    ObjectSerializer(type, this)
+                    val singleton = clazz.objectInstance()
+                    if (singleton != null) {
+                       whitelist.requireWhitelisted(clazz)
+                       SingletonSerializer(clazz, singleton, this)
+                   } else {
+                       whitelist.requireWhitelisted(type)
+                       ObjectSerializer(type, this)
+                   }
                 }
             }
         }

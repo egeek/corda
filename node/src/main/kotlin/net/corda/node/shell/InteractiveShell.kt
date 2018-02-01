@@ -1,6 +1,5 @@
 package net.corda.node.shell
 
-import com.fasterxml.jackson.core.JsonFactory
 import com.fasterxml.jackson.core.JsonGenerator
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.databind.*
@@ -188,21 +187,22 @@ object InteractiveShell {
         // Return a standard Corda Jackson object mapper, configured to use YAML by default and with extra
         // serializers.
         JacksonSupport.createInMemoryMapper(identityService, YAMLFactory(), true).apply {
-            val rpcModule = SimpleModule()
-            rpcModule.addDeserializer(InputStream::class.java, InputStreamDeserializer)
-            rpcModule.addDeserializer(UniqueIdentifier::class.java, UniqueIdentifierDeserializer)
-            rpcModule.addDeserializer(UUID::class.java, UUIDDeserializer)
+            val rpcModule = SimpleModule().apply {
+                addDeserializer(InputStream::class.java, InputStreamDeserializer)
+                addDeserializer(UniqueIdentifier::class.java, UniqueIdentifierDeserializer)
+            }
             registerModule(rpcModule)
         }
     }
 
-    private fun createOutputMapper(factory: JsonFactory): ObjectMapper {
-        return JacksonSupport.createNonRpcMapper(factory).apply {
+    private fun createOutputMapper(): ObjectMapper {
+        return JacksonSupport.createNonRpcMapper().apply {
             // Register serializers for stateful objects from libraries that are special to the RPC system and don't
             // make sense to print out to the screen. For classes we own, annotations can be used instead.
-            val rpcModule = SimpleModule()
-            rpcModule.addSerializer(Observable::class.java, ObservableSerializer)
-            rpcModule.addSerializer(InputStream::class.java, InputStreamSerializer)
+            val rpcModule = SimpleModule().apply {
+                addSerializer(Observable::class.java, ObservableSerializer)
+                addSerializer(InputStream::class.java, InputStreamSerializer)
+            }
             registerModule(rpcModule)
 
             disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)
@@ -211,7 +211,7 @@ object InteractiveShell {
     }
 
     // TODO: This should become the default renderer rather than something used specifically by commands.
-    private val yamlMapper by lazy { createOutputMapper(YAMLFactory()) }
+    private val outputMapper by lazy { createOutputMapper() }
 
     /**
      * Called from the 'flow' shell command. Takes a name fragment and finds a matching flow, or prints out
@@ -220,36 +220,57 @@ object InteractiveShell {
      */
     @JvmStatic
     fun runFlowByNameFragment(nameFragment: String, inputData: String, output: RenderPrintWriter, rpcOps: CordaRPCOps, ansiProgressRenderer: ANSIProgressRenderer) {
-        val matches = rpcOps.registeredFlows().filter { nameFragment in it }
+        val matches = try {
+            rpcOps.registeredFlows().filter { nameFragment in it }
+        } catch (e: PermissionException) {
+            output.println(e.message ?: "Access denied", Color.red)
+            return
+        }
         if (matches.isEmpty()) {
             output.println("No matching flow found, run 'flow list' to see your options.", Color.red)
             return
-        } else if (matches.size > 1) {
+        } else if (matches.size > 1 && matches.find { it.endsWith(nameFragment)} == null) {
             output.println("Ambiguous name provided, please be more specific. Your options are:")
             matches.forEachIndexed { i, s -> output.println("${i + 1}. $s", Color.yellow) }
             return
         }
 
-        val clazz: Class<FlowLogic<*>> = uncheckedCast(Class.forName(matches.single()))
+        val flowName = matches.find { it.endsWith(nameFragment)} ?: matches.single()
+        val clazz: Class<FlowLogic<*>> = uncheckedCast(Class.forName(flowName))
         try {
             // Show the progress tracker on the console until the flow completes or is interrupted with a
             // Ctrl-C keypress.
             val stateObservable = runFlowFromString({ clazz, args -> rpcOps.startTrackedFlowDynamic(clazz, *args) }, inputData, clazz)
 
             val latch = CountDownLatch(1)
-            ansiProgressRenderer.render(stateObservable, { latch.countDown() })
-            try {
-                // Wait for the flow to end and the progress tracker to notice. By the time the latch is released
-                // the tracker is done with the screen.
-                latch.await()
-            } catch (e: InterruptedException) {
-                // TODO: When the flow framework allows us to kill flows mid-flight, do so here.
+            ansiProgressRenderer.render(stateObservable, latch::countDown)
+            // Wait for the flow to end and the progress tracker to notice. By the time the latch is released
+            // the tracker is done with the screen.
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    latch.await()
+                    break
+                } catch (e: InterruptedException) {
+                    try {
+                        // TODO: When the flow framework allows us to kill flows mid-flight, do so here.
+                    } finally {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+            }
+            stateObservable.returnValue.get()?.apply {
+                if (this !is Throwable) {
+                    output.println("Flow completed with result: $this")
+                }
             }
         } catch (e: NoApplicableConstructor) {
             output.println("No matching constructor found:", Color.red)
             e.errors.forEach { output.println("- $it", Color.red) }
         } catch (e: PermissionException) {
             output.println(e.message ?: "Access denied", Color.red)
+        } catch (e: ExecutionException) {
+          // ignoring it as already logged by the progress handler subscriber
         } finally {
             InputStreamDeserializer.closeAll()
         }
@@ -281,7 +302,7 @@ object InteractiveShell {
         for (ctor in clazz.constructors) {
             var paramNamesFromConstructor: List<String>? = null
             fun getPrototype(): List<String> {
-                val argTypes = ctor.parameterTypes.map { it.simpleName }
+                val argTypes = ctor.genericParameterTypes.map { it.typeName }
                 return paramNamesFromConstructor!!.zip(argTypes).map { (name, type) -> "$name: $type" }
             }
 
@@ -289,10 +310,10 @@ object InteractiveShell {
                 // Attempt construction with the given arguments.
                 val args = database.transaction {
                     paramNamesFromConstructor = parser.paramNamesFromConstructor(ctor)
-                    parser.parseArguments(clazz.name, paramNamesFromConstructor!!.zip(ctor.parameterTypes), inputData)
+                    parser.parseArguments(clazz.name, paramNamesFromConstructor!!.zip(ctor.genericParameterTypes), inputData)
                 }
-                if (args.size != ctor.parameterTypes.size) {
-                    errors.add("${getPrototype()}: Wrong number of arguments (${args.size} provided, ${ctor.parameterTypes.size} needed)")
+                if (args.size != ctor.genericParameterTypes.size) {
+                    errors.add("${getPrototype()}: Wrong number of arguments (${args.size} provided, ${ctor.genericParameterTypes.size} needed)")
                     continue
                 }
                 val flow = ctor.newInstance(*args) as FlowLogic<*>
@@ -306,10 +327,10 @@ object InteractiveShell {
             } catch (e: StringToMethodCallParser.UnparseableCallException.TooManyParameters) {
                 errors.add("${getPrototype()}: too many parameters")
             } catch (e: StringToMethodCallParser.UnparseableCallException.ReflectionDataMissing) {
-                val argTypes = ctor.parameterTypes.map { it.simpleName }
+                val argTypes = ctor.genericParameterTypes.map { it.typeName }
                 errors.add("$argTypes: <constructor missing parameter reflection data>")
             } catch (e: StringToMethodCallParser.UnparseableCallException) {
-                val argTypes = ctor.parameterTypes.map { it.simpleName }
+                val argTypes = ctor.genericParameterTypes.map { it.typeName }
                 errors.add("$argTypes: ${e.message}")
             }
         }
@@ -394,11 +415,19 @@ object InteractiveShell {
         return result
     }
 
-    private fun printAndFollowRPCResponse(response: Any?, toStream: PrintWriter): CordaFuture<Unit> {
-        val printerFun = yamlMapper::writeValueAsString
-        toStream.println(printerFun(response))
-        toStream.flush()
-        return maybeFollow(response, printerFun, toStream)
+    private fun printAndFollowRPCResponse(response: Any?, out: PrintWriter): CordaFuture<Unit> {
+
+        val mapElement: (Any?) -> String = { element -> outputMapper.writerWithDefaultPrettyPrinter().writeValueAsString(element) }
+        val mappingFunction: (Any?) -> String = { value ->
+            if (value is Collection<*>) {
+                value.joinToString(",${System.lineSeparator()}  ", "[${System.lineSeparator()}  ", "${System.lineSeparator()}]") { element ->
+                    mapElement(element)
+                }
+            } else {
+                mapElement(value)
+            }
+        }
+        return maybeFollow(response, mappingFunction, out)
     }
 
     private class PrintingSubscriber(private val printerFun: (Any?) -> String, private val toStream: PrintWriter) : Subscriber<Any>() {
@@ -421,6 +450,7 @@ object InteractiveShell {
         override fun onNext(t: Any?) {
             count++
             toStream.println("Observation $count: " + printerFun(t))
+            toStream.flush()
         }
 
         @Synchronized
@@ -431,25 +461,32 @@ object InteractiveShell {
         }
     }
 
-    private fun maybeFollow(response: Any?, printerFun: (Any?) -> String, toStream: PrintWriter): CordaFuture<Unit> {
+    private fun maybeFollow(response: Any?, printerFun: (Any?) -> String, out: PrintWriter): CordaFuture<Unit> {
         // Match on a couple of common patterns for "important" observables. It's tough to do this in a generic
         // way because observables can be embedded anywhere in the object graph, and can emit other arbitrary
         // object graphs that contain yet more observables. So we just look for top level responses that follow
         // the standard "track" pattern, and print them until the user presses Ctrl-C
         if (response == null) return doneFuture(Unit)
 
-        val observable: Observable<*> = when (response) {
-            is Observable<*> -> response
-            is DataFeed<*, *> -> {
-                toStream.println("Snapshot")
-                toStream.println(response.snapshot)
-                response.updates
-            }
-            else -> return doneFuture(Unit)
+        if (response !is Observable<*> && response !is DataFeed<*, *>) {
+            out.println(printerFun(response))
+            return doneFuture(Unit)
         }
 
-        val subscriber = PrintingSubscriber(printerFun, toStream)
-        uncheckedCast(observable).subscribe(subscriber)
+        if (response is DataFeed<*, *>) {
+            out.println("Snapshot:")
+            out.println(printerFun(response.snapshot))
+            out.flush()
+            out.println("Updates:")
+            return printNextElements(response.updates, printerFun, out)
+        }
+        return printNextElements(response as Observable<*>, printerFun, out)
+    }
+
+    private fun printNextElements(elements: Observable<*>, printerFun: (Any?) -> String, out: PrintWriter): CordaFuture<Unit> {
+
+        val subscriber = PrintingSubscriber(printerFun, out)
+        uncheckedCast(elements).subscribe(subscriber)
         return subscriber.future
     }
 
@@ -529,16 +566,6 @@ object InteractiveShell {
             }
             //Any other string used as externalId.
             return UniqueIdentifier.fromString(p.text)
-        }
-    }
-
-    /**
-     * String value deserialized to [UUID].
-     * */
-    object UUIDDeserializer : JsonDeserializer<UUID>() {
-        override fun deserialize(p: JsonParser, ctxt: DeserializationContext): UUID {
-            //Create UUID object from string.
-            return UUID.fromString(p.text)
         }
     }
 

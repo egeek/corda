@@ -2,17 +2,20 @@
 
 package net.corda.core.internal
 
-import net.corda.core.cordapp.CordappProvider
-import net.corda.core.crypto.Crypto
-import net.corda.core.crypto.SecureHash
-import net.corda.core.crypto.sha256
+import net.corda.core.crypto.*
+import net.corda.core.flows.NotarisationRequest
+import net.corda.core.flows.NotarisationRequestSignature
+import net.corda.core.flows.NotaryFlow
 import net.corda.core.identity.CordaX500Name
+import net.corda.core.node.ServiceHub
 import net.corda.core.node.ServicesForResolution
 import net.corda.core.serialization.SerializationContext
+import net.corda.core.serialization.SerializedBytes
 import net.corda.core.serialization.deserialize
 import net.corda.core.serialization.serialize
 import net.corda.core.transactions.TransactionBuilder
 import net.corda.core.transactions.WireTransaction
+import net.corda.core.utilities.OpaqueBytes
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.asn1.x500.X500NameBuilder
 import org.bouncycastle.asn1.x500.style.BCStyle
@@ -30,6 +33,8 @@ import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.*
 import java.nio.file.attribute.FileAttribute
+import java.nio.file.attribute.FileTime
+import java.security.KeyPair
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
 import java.time.Duration
@@ -48,6 +53,19 @@ import kotlin.reflect.KClass
 import kotlin.reflect.full.createInstance
 
 val Throwable.rootCause: Throwable get() = cause?.rootCause ?: this
+
+val Throwable.rootMessage: String? get() {
+    var message = this.message
+    var throwable = cause
+    while (throwable != null) {
+        if (throwable.message != null) {
+            message = throwable.message
+        }
+        throwable = throwable.cause
+    }
+    return message
+}
+
 fun Throwable.getStackTraceAsString() = StringWriter().also { printStackTrace(PrintWriter(it)) }.toString()
 
 infix fun Temporal.until(endExclusive: Temporal): Duration = Duration.between(this, endExclusive)
@@ -121,6 +139,7 @@ fun Path.moveTo(target: Path, vararg options: CopyOption): Path = Files.move(thi
 fun Path.isRegularFile(vararg options: LinkOption): Boolean = Files.isRegularFile(this, *options)
 fun Path.isDirectory(vararg options: LinkOption): Boolean = Files.isDirectory(this, *options)
 inline val Path.size: Long get() = Files.size(this)
+fun Path.lastModifiedTime(vararg options: LinkOption): FileTime = Files.getLastModifiedTime(this, *options)
 inline fun <R> Path.list(block: (Stream<Path>) -> R): R = Files.list(this).use(block)
 fun Path.deleteIfExists(): Boolean = Files.deleteIfExists(this)
 fun Path.reader(charset: Charset = UTF_8): BufferedReader = Files.newBufferedReader(this, charset)
@@ -137,6 +156,8 @@ inline fun Path.write(createDirs: Boolean = false, vararg options: OpenOption = 
 inline fun <R> Path.readLines(charset: Charset = UTF_8, block: (Stream<String>) -> R): R = Files.lines(this, charset).use(block)
 fun Path.readAllLines(charset: Charset = UTF_8): List<String> = Files.readAllLines(this, charset)
 fun Path.writeLines(lines: Iterable<CharSequence>, charset: Charset = UTF_8, vararg options: OpenOption): Path = Files.write(this, lines, charset, *options)
+
+inline fun <reified T : Any> Path.readObject(): T = readAll().deserialize()
 
 fun InputStream.copyTo(target: Path, vararg options: CopyOption): Long = Files.copy(this, target, *options)
 
@@ -246,6 +267,13 @@ fun IntProgression.stream(parallel: Boolean = false): IntStream = StreamSupport.
 // When toArray has filled in the array, the component type is no longer T? but T (that may itself be nullable):
 inline fun <reified T> Stream<out T>.toTypedArray(): Array<T> = uncheckedCast(toArray { size -> arrayOfNulls<T>(size) })
 
+inline fun <T, R : Any> Stream<T>.mapNotNull(crossinline transform: (T) -> R?): Stream<R> {
+    return flatMap {
+        val value = transform(it)
+        if (value != null) Stream.of(value) else Stream.empty()
+    }
+}
+
 fun <T> Class<T>.castIfPossible(obj: Any): T? = if (isInstance(obj)) cast(obj) else null
 
 /** Returns a [DeclaredField] wrapper around the declared (possibly non-public) static field of the receiver [Class]. */
@@ -295,8 +323,8 @@ fun <T, U : T> uncheckedCast(obj: T) = obj as U
 fun <K, V> Iterable<Pair<K, V>>.toMultiMap(): Map<K, List<V>> = this.groupBy({ it.first }) { it.second }
 
 /** Provide access to internal method for AttachmentClassLoaderTests */
-fun TransactionBuilder.toWireTransaction(cordappProvider: CordappProvider, serializationContext: SerializationContext): WireTransaction {
-    return toWireTransactionWithContext(cordappProvider, serializationContext)
+fun TransactionBuilder.toWireTransaction(services: ServicesForResolution, serializationContext: SerializationContext): WireTransaction {
+    return toWireTransactionWithContext(services, serializationContext)
 }
 
 /** Provide access to internal method for AttachmentClassLoaderTests */
@@ -306,6 +334,16 @@ fun TransactionBuilder.toLedgerTransaction(services: ServicesForResolution, seri
 val KClass<*>.packageName: String get() = java.`package`.name
 
 fun URL.openHttpConnection(): HttpURLConnection = openConnection() as HttpURLConnection
+
+fun URL.post(serializedData: OpaqueBytes) {
+    openHttpConnection().apply {
+        doOutput = true
+        requestMethod = "POST"
+        setRequestProperty("Content-Type", "application/octet-stream")
+        outputStream.use { serializedData.open().copyTo(it) }
+        checkOkResponse()
+    }
+}
 
 fun HttpURLConnection.checkOkResponse() {
     if (responseCode != 200) {
@@ -352,4 +390,27 @@ fun <T : Any> T.signWithCert(privateKey: PrivateKey, certificate: X509Certificat
     val serialised = serialize()
     val signature = Crypto.doSign(privateKey, serialised.bytes)
     return SignedDataWithCert(serialised, DigitalSignatureWithCert(certificate, signature))
+}
+
+inline fun <T : Any> SerializedBytes<T>.sign(signer: (SerializedBytes<T>) -> DigitalSignature.WithKey): SignedData<T> {
+    return SignedData(this, signer(this))
+}
+
+fun <T : Any> SerializedBytes<T>.sign(keyPair: KeyPair): SignedData<T> = SignedData(this, keyPair.sign(this.bytes))
+
+/** Verifies that the correct notarisation request was signed by the counterparty. */
+fun NotaryFlow.Service.validateRequest(request: NotarisationRequest, signature: NotarisationRequestSignature) {
+    val requestingParty = otherSideSession.counterparty
+    request.verifySignature(signature, requestingParty)
+    // TODO: persist the signature for traceability. Do we need to persist the request as well?
+}
+
+/** Creates a signature over the notarisation request using the legal identity key. */
+fun NotarisationRequest.generateSignature(serviceHub: ServiceHub): NotarisationRequestSignature {
+    val serializedRequest = this.serialize().bytes
+    val signature = with(serviceHub) {
+        val myLegalIdentity = myInfo.legalIdentitiesAndCerts.first().owningKey
+        keyManagementService.sign(serializedRequest, myLegalIdentity)
+    }
+    return NotarisationRequestSignature(signature, serviceHub.myInfo.platformVersion)
 }

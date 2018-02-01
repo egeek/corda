@@ -42,8 +42,11 @@ enum class TransactionIsolationLevel {
     val jdbcValue: Int = java.sql.Connection::class.java.getField("TRANSACTION_$name").get(null) as Int
 }
 
-private val _contextDatabase = ThreadLocal<CordaPersistence>()
-val contextDatabase get() = _contextDatabase.get() ?: error("Was expecting to find CordaPersistence set on current thread: ${Strand.currentStrand()}")
+private val _contextDatabase = InheritableThreadLocal<CordaPersistence>()
+var contextDatabase: CordaPersistence
+    get() = _contextDatabase.get() ?: error("Was expecting to find CordaPersistence set on current thread: ${Strand.currentStrand()}")
+    set(database) = _contextDatabase.set(database)
+val contextDatabaseOrNull: CordaPersistence? get() = _contextDatabase.get()
 
 class CordaPersistence(
         val dataSource: DataSource,
@@ -79,6 +82,9 @@ class CordaPersistence(
         // Check not in read-only mode.
         transaction {
             check(!connection.metaData.isReadOnly) { "Database should not be readonly." }
+
+            checkCorrectAttachmentsContractsTableName(connection)
+            checkCorrectCheckpointTypeOnPostgres(connection)
         }
     }
 
@@ -104,6 +110,7 @@ class CordaPersistence(
     fun createSession(): Connection {
         // We need to set the database for the current [Thread] or [Fiber] here as some tests share threads across databases.
         _contextDatabase.set(this)
+        currentDBSession().flush()
         return contextTransaction.connection
     }
 
@@ -239,6 +246,48 @@ fun <T : Any> rx.Observable<T>.wrapWithDatabaseTransaction(db: CordaPersistence?
         // If cleanup removed the last subscriber reset the system, as future subscribers might need the stream again
         if (wrappingSubscriber.delegates.isEmpty()) {
             wrappingSubscriber = DatabaseTransactionWrappingSubscriber(db)
+        }
+    }
+}
+
+class IncompatibleAttachmentsContractsTableName(override val message: String?, override val cause: Throwable? = null) : Exception()
+
+/** Check if any nested cause is of [SQLException] type. */
+private fun Throwable.hasSQLExceptionCause(): Boolean =
+        when (cause) {
+            null -> false
+            is SQLException -> true
+            else -> cause?.hasSQLExceptionCause() ?: false
+        }
+
+class CouldNotCreateDataSourceException(override val message: String?, override val cause: Throwable? = null) : Exception()
+
+class DatabaseIncompatibleException(override val message: String?, override val cause: Throwable? = null) : Exception()
+
+private fun checkCorrectAttachmentsContractsTableName(connection: Connection) {
+    val correctName = "NODE_ATTACHMENTS_CONTRACTS"
+    val incorrectV30Name = "NODE_ATTACHMENTS_CONTRACT_CLASS_NAME"
+    val incorrectV31Name = "NODE_ATTCHMENTS_CONTRACTS"
+
+    fun warning(incorrectName: String, version: String) = "The database contains the older table name $incorrectName instead of $correctName, see upgrade notes to migrate from Corda database version $version https://docs.corda.net/head/upgrade-notes.html."
+
+    if (!connection.metaData.getTables(null, null, correctName, null).next()) {
+        if (connection.metaData.getTables(null, null, incorrectV30Name, null).next()) { throw DatabaseIncompatibleException(warning(incorrectV30Name, "3.0")) }
+        if (connection.metaData.getTables(null, null, incorrectV31Name, null).next()) { throw DatabaseIncompatibleException(warning(incorrectV31Name, "3.1")) }
+    }
+}
+
+private fun checkCorrectCheckpointTypeOnPostgres(connection: Connection) {
+    val metaData = connection.metaData
+    if (metaData.getDatabaseProductName() != "PostgreSQL") {
+        return
+    }
+
+    val result = metaData.getColumns(null, null, "node_checkpoints", "checkpoint_value")
+    if (result.next()) {
+        val type = result.getString("TYPE_NAME")
+        if (type != "bytea") {
+            throw DatabaseIncompatibleException("The type of the 'checkpoint_value' table must be 'bytea', but 'oid' was found. See upgrade notes to migrate from Corda database version 3.1 https://docs.corda.net/head/upgrade-notes.html.")
         }
     }
 }

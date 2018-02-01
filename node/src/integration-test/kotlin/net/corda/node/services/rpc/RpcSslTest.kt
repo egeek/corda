@@ -1,12 +1,16 @@
 package net.corda.node.services.rpc
 
+import net.corda.client.rpc.CordaRPCClient
+import net.corda.client.rpc.internal.createCordaRPCClientWithSsl
 import net.corda.core.identity.CordaX500Name
 import net.corda.core.utilities.getOrThrow
 import net.corda.node.services.Permissions.Companion.all
 import net.corda.node.testsupport.withCertificates
 import net.corda.node.testsupport.withKeyStores
+import net.corda.testing.driver.DriverParameters
 import net.corda.testing.driver.PortAllocation
 import net.corda.testing.driver.driver
+import net.corda.testing.driver.internal.RandomFree
 import net.corda.testing.internal.useSslRpcOverrides
 import net.corda.testing.node.User
 import org.assertj.core.api.Assertions.assertThat
@@ -30,9 +34,9 @@ class RpcSslTest {
 
             withKeyStores(server, client) { nodeSslOptions, clientSslOptions ->
                 var successful = false
-                driver(isDebug = true, startNodesInProcess = true, portAllocation = PortAllocation.RandomFree) {
+                driver(DriverParameters(isDebug = true, startNodesInProcess = true, portAllocation = RandomFree)) {
                     startNode(rpcUsers = listOf(user), customOverrides = nodeSslOptions.useSslRpcOverrides()).getOrThrow().use { node ->
-                        node.rpcClientToNode(clientSslOptions).start(user.username, user.password).use { connection ->
+                        createCordaRPCClientWithSsl(node.rpcAddress, sslConfiguration = clientSslOptions).start(user.username, user.password).use { connection ->
                             connection.proxy.apply {
                                 nodeInfo()
                                 successful = true
@@ -49,9 +53,9 @@ class RpcSslTest {
     fun rpc_client_not_using_ssl() {
         val user = User("mark", "dadada", setOf(all()))
         var successful = false
-        driver(isDebug = true, startNodesInProcess = true, portAllocation = PortAllocation.RandomFree) {
+        driver(DriverParameters(isDebug = true, startNodesInProcess = true, portAllocation = RandomFree)) {
             startNode(rpcUsers = listOf(user)).getOrThrow().use { node ->
-                node.rpcClientToNode().start(user.username, user.password).use { connection ->
+                CordaRPCClient(node.rpcAddress).start(user.username, user.password).use { connection ->
                     connection.proxy.apply {
                         nodeInfo()
                         successful = true

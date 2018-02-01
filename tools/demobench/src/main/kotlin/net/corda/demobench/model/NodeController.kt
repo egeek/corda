@@ -10,9 +10,9 @@ import net.corda.core.internal.noneOrSingle
 import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.demobench.plugin.CordappController
 import net.corda.demobench.pty.R3Pty
-import net.corda.nodeapi.internal.network.NetworkParameters
+import net.corda.core.node.NetworkParameters
 import net.corda.nodeapi.internal.network.NetworkParametersCopier
-import net.corda.nodeapi.internal.network.NotaryInfo
+import net.corda.core.node.NotaryInfo
 import net.corda.nodeapi.internal.DevIdentityGenerator
 import tornadofx.*
 import java.io.IOException
@@ -74,7 +74,10 @@ class NodeController(check: atRuntime = ::checkExists) : Controller() {
                         country = location.countryCode
                 ),
                 p2pAddress = nodeData.p2pPort.toLocalAddress(),
-                rpcAddress = nodeData.rpcPort.toLocalAddress(),
+                rpcSettings = NodeRpcSettings(
+                        address = nodeData.rpcPort.toLocalAddress(),
+                        adminAddress = nodeData.rpcAdminPort.toLocalAddress()
+                ),
                 webAddress = nodeData.webPort.toLocalAddress(),
                 notary = notary,
                 h2port = nodeData.h2Port.value,
@@ -143,8 +146,9 @@ class NodeController(check: atRuntime = ::checkExists) : Controller() {
                 notaries = listOf(NotaryInfo(identity, config.nodeConfig.notary!!.validating)),
                 modifiedTime = Instant.now(),
                 maxMessageSize = 10485760,
-                maxTransactionSize = 40000,
-                epoch = 1
+                maxTransactionSize = Int.MAX_VALUE,
+                epoch = 1,
+                whitelistedContractImplementations = emptyMap()
         ))
         notaryIdentity = identity
         networkParametersCopier = parametersCopier
@@ -202,7 +206,7 @@ class NodeController(check: atRuntime = ::checkExists) : Controller() {
     }
 
     private fun updatePort(config: NodeConfig) {
-        val nextPort = 1 + arrayOf(config.p2pAddress.port, config.rpcAddress.port, config.webAddress.port, config.h2port).max() as Int
+        val nextPort = 1 + arrayOf(config.p2pAddress.port, config.rpcSettings.address.port, config.webAddress.port, config.h2port).max() as Int
         port.getAndUpdate { Math.max(nextPort, it) }
     }
 

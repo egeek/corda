@@ -2,13 +2,14 @@ package net.corda.node.services.keys
 
 import net.corda.core.crypto.*
 import net.corda.core.identity.PartyAndCertificate
+import net.corda.core.node.services.IdentityService
 import net.corda.core.node.services.KeyManagementService
 import net.corda.core.serialization.SingletonSerializeAsToken
 import net.corda.core.utilities.MAX_HASH_HEX_SIZE
-import net.corda.node.services.api.IdentityServiceInternal
 import net.corda.node.utilities.AppendOnlyPersistentMap
 import net.corda.nodeapi.internal.persistence.NODE_DATABASE_PREFIX
 import org.bouncycastle.operator.ContentSigner
+import java.io.Serializable
 import java.security.KeyPair
 import java.security.PrivateKey
 import java.security.PublicKey
@@ -24,7 +25,7 @@ import javax.persistence.Lob
  *
  * This class needs database transactions to be in-flight during method calls and init.
  */
-class PersistentKeyManagementService(val identityService: IdentityServiceInternal,
+class PersistentKeyManagementService(val identityService: IdentityService,
                                      initialKeys: Set<KeyPair>) : SingletonSerializeAsToken(), KeyManagementService {
 
     @Entity
@@ -42,7 +43,7 @@ class PersistentKeyManagementService(val identityService: IdentityServiceInterna
             @Lob
             @Column(name = "private_key")
             var privateKey: ByteArray = ByteArray(0)
-    ) {
+    ) : Serializable {
         constructor(publicKey: PublicKey, privateKey: PrivateKey)
             : this(publicKey.toStringShort(), publicKey.encoded, privateKey.encoded)
     }

@@ -88,7 +88,7 @@ dependencies {
     compile "org.fusesource.jansi:jansi:$jansi_version"
 
     // Manifests: for reading stuff from the manifest file
-    compile "com.jcabi:jcabi-manifests:1.1"
+    compile "com.jcabi:jcabi-manifests:$jcabi_manifests_version"
 
     compile("com.intellij:forms_rt:7.0.3") {
         exclude group: "asm"
@@ -159,9 +159,6 @@ dependencies {
     compile 'commons-codec:commons-codec:1.10'
     compile 'com.github.bft-smart:library:master-v1.1-beta-g6215ec8-87'
 
-    // FastClasspathScanner: classpath scanning
-    compile 'io.github.lukehutch:fast-classpath-scanner:2.0.21'
-
     // Apache Shiro: authentication, authorization and session management.
     compile "org.apache.shiro:shiro-core:${shiro_version}"
 
@@ -184,7 +181,7 @@ dependencies {
     testCompile "org.glassfish.jersey.containers:jersey-container-jetty-http:${jersey_version}"
 
     // Jolokia JVM monitoring agent
-    runtime "org.jolokia:jolokia-jvm:${jolokia_version}:agent"
+    compile "org.jolokia:jolokia-jvm:${jolokia_version}:agent"
 }
 
 task integrationTest(type: Test) {

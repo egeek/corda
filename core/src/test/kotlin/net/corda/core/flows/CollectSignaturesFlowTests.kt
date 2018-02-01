@@ -8,6 +8,7 @@ import net.corda.core.identity.CordaX500Name
 import net.corda.core.identity.Party
 import net.corda.core.identity.excludeHostNode
 import net.corda.core.identity.groupAbstractPartyByWellKnownParty
+import net.corda.core.node.services.IdentityService
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.transactions.TransactionBuilder
 import net.corda.core.utilities.getOrThrow
@@ -15,9 +16,10 @@ import net.corda.node.internal.StartedNode
 import net.corda.testing.contracts.DummyContract
 import net.corda.testing.core.*
 import net.corda.testing.internal.rigorousMock
-import net.corda.testing.node.MockNetwork
 import net.corda.testing.node.MockServices
-import net.corda.testing.node.startFlow
+import net.corda.testing.node.internal.InternalMockNetwork
+import net.corda.testing.node.internal.InternalMockNetwork.MockNode
+import net.corda.testing.node.internal.startFlow
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -29,10 +31,10 @@ class CollectSignaturesFlowTests {
         private val miniCorp = TestIdentity(CordaX500Name("MiniCorp", "London", "GB"))
     }
 
-    private lateinit var mockNet: MockNetwork
-    private lateinit var aliceNode: StartedNode<MockNetwork.MockNode>
-    private lateinit var bobNode: StartedNode<MockNetwork.MockNode>
-    private lateinit var charlieNode: StartedNode<MockNetwork.MockNode>
+    private lateinit var mockNet: InternalMockNetwork
+    private lateinit var aliceNode: StartedNode<MockNode>
+    private lateinit var bobNode: StartedNode<MockNode>
+    private lateinit var charlieNode: StartedNode<MockNode>
     private lateinit var alice: Party
     private lateinit var bob: Party
     private lateinit var charlie: Party
@@ -40,7 +42,7 @@ class CollectSignaturesFlowTests {
 
     @Before
     fun setup() {
-        mockNet = MockNetwork(cordappPackages = listOf("net.corda.testing.contracts"))
+        mockNet = InternalMockNetwork(cordappPackages = listOf("net.corda.testing.contracts", "net.corda.core.flows"))
         aliceNode = mockNet.createPartyNode(ALICE_NAME)
         bobNode = mockNet.createPartyNode(BOB_NAME)
         charlieNode = mockNet.createPartyNode(CHARLIE_NAME)
@@ -53,12 +55,6 @@ class CollectSignaturesFlowTests {
     @After
     fun tearDown() {
         mockNet.stopNodes()
-    }
-
-    private fun registerFlowOnAllNodes(flowClass: KClass<out FlowLogic<*>>) {
-        listOf(aliceNode, bobNode, charlieNode).forEach {
-            it.registerInitiatedFlow(flowClass.java)
-        }
     }
 
     // With this flow, the initiator starts the "CollectTransactionFlow". It is then the responders responsibility to
@@ -109,7 +105,6 @@ class CollectSignaturesFlowTests {
             // Normally this is handled by TransactionKeyFlow, but here we have to manually let A know about the identity
             aliceNode.services.identityService.verifyAndRegisterIdentity(bConfidentialIdentity)
         }
-        registerFlowOnAllNodes(TestFlow.Responder::class)
         val magicNumber = 1337
         val parties = listOf(alice, bConfidentialIdentity.party, charlie)
         val state = DummyContract.MultiOwnerState(magicNumber, parties)
@@ -136,7 +131,7 @@ class CollectSignaturesFlowTests {
     @Test
     fun `fails when not signed by initiator`() {
         val onePartyDummyContract = DummyContract.generateInitial(1337, notary, alice.ref(1))
-        val miniCorpServices = MockServices(listOf("net.corda.testing.contracts"), rigorousMock(), miniCorp)
+        val miniCorpServices = MockServices(listOf("net.corda.testing.contracts"), miniCorp, rigorousMock<IdentityService>())
         val ptx = miniCorpServices.signInitialTransaction(onePartyDummyContract)
         val flow = aliceNode.services.startFlow(CollectSignaturesFlow(ptx, emptySet()))
         mockNet.runNetwork()

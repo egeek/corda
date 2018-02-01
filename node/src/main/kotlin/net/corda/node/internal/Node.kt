@@ -2,11 +2,13 @@ package net.corda.node.internal
 
 import com.codahale.metrics.JmxReporter
 import net.corda.core.concurrent.CordaFuture
+import net.corda.core.internal.Emoji
 import net.corda.core.internal.concurrent.openFuture
 import net.corda.core.internal.concurrent.thenMatch
 import net.corda.core.internal.div
 import net.corda.core.internal.uncheckedCast
 import net.corda.core.messaging.RPCOps
+import net.corda.core.node.NetworkParameters
 import net.corda.core.node.NodeInfo
 import net.corda.core.node.ServiceHub
 import net.corda.core.node.services.IdentityService
@@ -15,12 +17,15 @@ import net.corda.core.serialization.internal.SerializationEnvironmentImpl
 import net.corda.core.serialization.internal.nodeSerializationEnv
 import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.core.utilities.contextLogger
+import net.corda.node.CordaClock
+import net.corda.node.SimpleClock
 import net.corda.node.VersionInfo
 import net.corda.node.internal.artemis.ArtemisBroker
 import net.corda.node.internal.artemis.BrokerAddresses
 import net.corda.node.internal.cordapp.CordappLoader
 import net.corda.node.internal.security.RPCSecurityManagerImpl
 import net.corda.node.serialization.KryoServerSerializationScheme
+import net.corda.node.services.api.NodePropertiesStore
 import net.corda.node.services.api.SchemaService
 import net.corda.node.services.config.NodeConfiguration
 import net.corda.node.services.config.SecurityConfiguration
@@ -70,6 +75,13 @@ open class Node(configuration: NodeConfiguration,
             LoggerFactory.getLogger(loggerName).info(msg)
         }
 
+        fun printWarning(message: String) {
+            Emoji.renderIfSupported {
+                println("ATTENTION: $message")
+            }
+            staticLog.warn(message)
+        }
+
         internal fun failStartUp(message: String): Nothing {
             println(message)
             println("Corda will now exit...")
@@ -81,13 +93,17 @@ open class Node(configuration: NodeConfiguration,
         }
 
         private val sameVmNodeCounter = AtomicInteger()
-        val scanPackagesSystemProperty = "net.corda.node.cordapp.scan.packages"
-        val scanPackagesSeparator = ","
+
+        const val scanPackagesSystemProperty = "net.corda.node.cordapp.scan.packages"
+        const val scanPackagesSeparator = ","
+
         private fun makeCordappLoader(configuration: NodeConfiguration): CordappLoader {
             return System.getProperty(scanPackagesSystemProperty)?.let { scanPackages ->
                 CordappLoader.createDefaultWithTestPackages(configuration, scanPackages.split(scanPackagesSeparator))
             } ?: CordappLoader.createDefault(configuration.baseDirectory)
         }
+
+        const val MAX_FILE_SIZE = 10485760
     }
 
     override val log: Logger get() = staticLog
@@ -143,7 +159,10 @@ open class Node(configuration: NodeConfiguration,
 
     private var shutdownHook: ShutdownHook? = null
 
-    override fun makeMessagingService(database: CordaPersistence, info: NodeInfo): MessagingService {
+    override fun makeMessagingService(database: CordaPersistence,
+                                      info: NodeInfo,
+                                      nodeProperties: NodePropertiesStore,
+                                      networkParameters: NetworkParameters): MessagingService {
         // Construct security manager reading users data either from the 'security' config section
         // if present or from rpcUsers list if the former is missing from config.
         val securityManagerConfig = configuration.security?.authService ?:
@@ -151,17 +170,23 @@ open class Node(configuration: NodeConfiguration,
 
         securityManager = RPCSecurityManagerImpl(securityManagerConfig)
 
-        val serverAddress = configuration.messagingServerAddress ?: makeLocalMessageBroker()
-        val rpcServerAddresses = if (configuration.rpcOptions.standAloneBroker) BrokerAddresses(configuration.rpcOptions.address!!, configuration.rpcOptions.adminAddress) else startLocalRpcBroker()
-        val advertisedAddress = info.addresses.single()
-        bridgeControlListener = BridgeControlListener(configuration, serverAddress, networkParameters.maxMessageSize)
+        val serverAddress = configuration.messagingServerAddress ?: makeLocalMessageBroker(networkParameters)
+        val rpcServerAddresses = if (configuration.rpcOptions.standAloneBroker) {
+            BrokerAddresses(configuration.rpcOptions.address!!, configuration.rpcOptions.adminAddress)
+        } else {
+            startLocalRpcBroker(networkParameters)
+        }
+        val advertisedAddress = info.addresses[0]
+        bridgeControlListener = BridgeControlListener(configuration, serverAddress, MAX_FILE_SIZE)
 
-        printBasicNodeInfo("Incoming connection address", advertisedAddress.toString())
+        printBasicNodeInfo("Advertised P2P messaging addresses", info.addresses.joinToString())
         rpcServerAddresses?.let {
-            rpcMessagingClient = RPCMessagingClient(configuration.rpcOptions.sslConfig, it.admin, networkParameters.maxMessageSize)
+            rpcMessagingClient = RPCMessagingClient(configuration.rpcOptions.sslConfig, it.admin, MAX_FILE_SIZE)
+            printBasicNodeInfo("RPC connection address", it.primary.toString())
+            printBasicNodeInfo("RPC admin connection address", it.admin.toString())
         }
         verifierMessagingClient = when (configuration.verifierType) {
-            VerifierType.OutOfProcess -> VerifierMessagingClient(configuration, serverAddress, services.monitoringService.metrics, networkParameters.maxMessageSize)
+            VerifierType.OutOfProcess -> VerifierMessagingClient(configuration, serverAddress, services.monitoringService.metrics, MAX_FILE_SIZE)
             VerifierType.InMemory -> null
         }
         require(info.legalIdentities.size in 1..2) { "Currently nodes must have a primary address and optionally one serviced address" }
@@ -176,19 +201,36 @@ open class Node(configuration: NodeConfiguration,
                 database,
                 services.networkMapCache,
                 advertisedAddress,
-                networkParameters.maxMessageSize)
+                MAX_FILE_SIZE,
+                isDrainingModeOn = nodeProperties.flowsDrainingMode::isEnabled,
+                drainingModeWasChangedEvents = nodeProperties.flowsDrainingMode.values)
     }
 
-    private fun startLocalRpcBroker(): BrokerAddresses? {
+    private fun startLocalRpcBroker(networkParameters: NetworkParameters): BrokerAddresses? {
         with(configuration) {
             return rpcOptions.address?.let {
                 require(rpcOptions.address != null) { "RPC address needs to be specified for local RPC broker." }
                 val rpcBrokerDirectory: Path = baseDirectory / "brokers" / "rpc"
                 with(rpcOptions) {
                     rpcBroker = if (useSsl) {
-                        ArtemisRpcBroker.withSsl(this.address!!, sslConfig, securityManager, certificateChainCheckPolicies, networkParameters.maxMessageSize, exportJMXto.isNotEmpty(), rpcBrokerDirectory)
+                        ArtemisRpcBroker.withSsl(
+                                this.address!!,
+                                sslConfig,
+                                securityManager,
+                                certificateChainCheckPolicies,
+                                MAX_FILE_SIZE,
+                                exportJMXto.isNotEmpty(),
+                                rpcBrokerDirectory)
                     } else {
-                        ArtemisRpcBroker.withoutSsl(this.address!!, adminAddress!!, sslConfig, securityManager, certificateChainCheckPolicies, networkParameters.maxMessageSize, exportJMXto.isNotEmpty(), rpcBrokerDirectory)
+                        ArtemisRpcBroker.withoutSsl(
+                                this.address!!,
+                                adminAddress!!,
+                                sslConfig,
+                                securityManager,
+                                certificateChainCheckPolicies,
+                                MAX_FILE_SIZE,
+                                exportJMXto.isNotEmpty(),
+                                rpcBrokerDirectory)
                     }
                 }
                 return rpcBroker!!.addresses
@@ -196,16 +238,14 @@ open class Node(configuration: NodeConfiguration,
         }
     }
 
-    private fun makeLocalMessageBroker(): NetworkHostAndPort {
+    private fun makeLocalMessageBroker(networkParameters: NetworkParameters): NetworkHostAndPort {
         with(configuration) {
-            messageBroker = ArtemisMessagingServer(this, p2pAddress.port, networkParameters.maxMessageSize)
+            messageBroker = ArtemisMessagingServer(this, p2pAddress.port, MAX_FILE_SIZE)
             return NetworkHostAndPort("localhost", p2pAddress.port)
         }
     }
 
-    override fun myAddresses(): List<NetworkHostAndPort> {
-        return listOf(configuration.messagingServerAddress ?: getAdvertisedAddress())
-    }
+    override fun myAddresses(): List<NetworkHostAndPort> = listOf(getAdvertisedAddress())
 
     private fun getAdvertisedAddress(): NetworkHostAndPort {
         return with(configuration) {

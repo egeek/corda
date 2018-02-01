@@ -150,6 +150,7 @@ class NodeControllerTest {
             organisation: String = "Unknown",
             p2pPort: Int = 0,
             rpcPort: Int = 0,
+            rpcAdminPort: Int = 0,
             webPort: Int = 0,
             h2port: Int = 0,
             notary: NotaryService? = null,
@@ -162,7 +163,10 @@ class NodeControllerTest {
                         country = "US"
                 ),
                 p2pAddress = localPort(p2pPort),
-                rpcAddress = localPort(rpcPort),
+                rpcSettings = NodeRpcSettings(
+                        address = localPort(rpcPort),
+                        adminAddress = localPort(rpcAdminPort)
+                ),
                 webAddress = localPort(webPort),
                 h2port = h2port,
                 notary = notary,

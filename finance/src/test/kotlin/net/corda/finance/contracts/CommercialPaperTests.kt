@@ -18,6 +18,7 @@ import net.corda.testing.core.*
 import net.corda.testing.dsl.EnforceVerifyOrFail
 import net.corda.testing.dsl.TransactionDSL
 import net.corda.testing.dsl.TransactionDSLInterpreter
+import net.corda.testing.internal.TEST_TX_TIME
 import net.corda.testing.internal.vault.VaultFiller
 import net.corda.testing.node.MockServices
 import net.corda.testing.node.MockServices.Companion.makeTestDatabaseAndMockServices
@@ -108,7 +109,7 @@ class CommercialPaperTestsGeneric {
     val testSerialization = SerializationEnvironmentRule()
 
     private val megaCorpRef = megaCorp.ref(123)
-    private val ledgerServices = MockServices(megaCorp, miniCorp)
+    private val ledgerServices = MockServices(listOf("net.corda.finance.schemas"), megaCorp, miniCorp)
 
     @Test
     fun `trade lifecycle test`() {
@@ -243,11 +244,11 @@ class CommercialPaperTestsGeneric {
         // MegaCorp will issue some commercial paper and Alice will buy it, using cash issued to her in the name
         // of the dummy cash issuer.
 
-        val allIdentities = arrayOf(megaCorp.identity, miniCorp.identity, dummyCashIssuer.identity, dummyNotary.identity)
-        val notaryServices = MockServices(dummyNotary)
-        val issuerServices = MockServices(dummyCashIssuer, dummyNotary)
+        val allIdentities = arrayOf(megaCorp.identity, alice.identity, dummyCashIssuer.identity, dummyNotary.identity)
+        val notaryServices = MockServices(listOf("net.corda.finance.contracts", "net.corda.finance.contracts.asset", "net.corda.finance.schemas"), dummyNotary)
+        val issuerServices = MockServices(listOf("net.corda.finance.contracts", "net.corda.finance.contracts.asset", "net.corda.finance.schemas"), dummyCashIssuer, dummyNotary)
         val (aliceDatabase, aliceServices) = makeTestDatabaseAndMockServices(
-                listOf("net.corda.finance.contracts"),
+                listOf("net.corda.finance.contracts", "net.corda.finance.contracts.asset", "net.corda.finance.schemas"),
                 makeTestIdentityService(*allIdentities),
                 alice
         )
@@ -256,7 +257,7 @@ class CommercialPaperTestsGeneric {
         }
 
         val (megaCorpDatabase, megaCorpServices) = makeTestDatabaseAndMockServices(
-                listOf("net.corda.finance.contracts"),
+                listOf("net.corda.finance.contracts", "net.corda.finance.contracts.asset", "net.corda.finance.schemas"),
                 makeTestIdentityService(*allIdentities),
                 megaCorp
         )
@@ -270,7 +271,7 @@ class CommercialPaperTestsGeneric {
 
         // MegaCorp™ issues $10,000 of commercial paper, to mature in 30 days, owned initially by itself.
         val faceValue = 10000.DOLLARS `issued by` dummyCashIssuer.ref(1)
-        val issuance = megaCorpServices.myInfo.chooseIdentity().ref(1)
+        val issuance = megaCorpServices.myInfo.singleIdentity().ref(1)
         val issueBuilder = CommercialPaper().generateIssue(issuance, faceValue, TEST_TX_TIME + 30.days, dummyNotary.party)
         issueBuilder.setTimeWindow(TEST_TX_TIME, 30.seconds)
         val issuePtx = megaCorpServices.signInitialTransaction(issueBuilder)
@@ -300,7 +301,7 @@ class CommercialPaperTestsGeneric {
             fun makeRedeemTX(time: Instant): Pair<SignedTransaction, UUID> {
                 val builder = TransactionBuilder(dummyNotary.party)
                 builder.setTimeWindow(time, 30.seconds)
-                CommercialPaper().generateRedeem(builder, moveTX.tx.outRef(1), megaCorpServices, megaCorpServices.myInfo.chooseIdentityAndCert())
+                CommercialPaper().generateRedeem(builder, moveTX.tx.outRef(1), megaCorpServices, megaCorpServices.myInfo.singleIdentityAndCert())
                 val ptx = aliceServices.signInitialTransaction(builder)
                 val ptx2 = megaCorpServices.addSignature(ptx)
                 val stx = notaryServices.addSignature(ptx2)

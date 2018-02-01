@@ -21,7 +21,7 @@ service.
     task deployNodes(type: net.corda.plugins.Cordform, dependsOn: ['jar']) {
         directory "./build/nodes"
         node {
-            name "O=NetworkMapAndNotary,L=London,C=GB"
+            name "O=Notary,L=London,C=GB"
             notary = [validating : true]
             p2pPort 10002
             rpcPort 10003
@@ -70,7 +70,7 @@ the three node folders. Each node folder has the following structure:
 
         .
         |____corda.jar                     // The runnable node
-        |____corda-webserver.jar           // The node's webserver
+        |____corda-webserver.jar           // The node's webserver (The notary doesn't need a web server)
         |____node.conf                     // The node's configuration file
         |____cordapps
         |____java/kotlin-source-0.1.jar  // Our IOU CorDapp
@@ -85,7 +85,7 @@ Let's start the nodes by running the following commands from the root of the pro
     // On Mac
     build/nodes/runnodes
 
-This will start a terminal window for each node, and an additional terminal window for each node's webserver - eight
+This will start a terminal window for each node, and an additional terminal window for each node's webserver - five
 terminal windows in all. Give each node a moment to start - you'll know it's ready when its terminal windows displays
 the message, "Welcome to the Corda interactive shell.".
 
@@ -105,13 +105,9 @@ commands.
 .. note:: Local terminal shell is available only in a development mode. In production environment SSH server can be enabled.
     More about SSH and how to connect can be found on the :doc:`shell` page.
 
-We want to create an IOU of 100 with PartyB. We start the ``IOUFlow`` by typing:
+We want to create an IOU of 99 with PartyB. We start the ``IOUFlow`` by typing:
 
 .. container:: codeset
-
-    .. code-block:: java
-
-        start IOUFlow arg0: 99, arg1: "O=PartyB,L=New York,C=US"
 
     .. code-block:: kotlin
 
@@ -142,7 +138,7 @@ The vaults of PartyA and PartyB should both display the following output:
           - "C=GB,L=London,O=PartyA"
           - "C=US,L=New York,O=PartyB"
         contract: "com.template.contract.IOUContract"
-        notary: "C=GB,L=London,O=NetworkMapAndNotary,CN=corda.notary.validating"
+        notary: "C=GB,L=London,O=Notary"
         encumbrance: null
         constraint:
           attachmentId: "F578320232CAB87BB1E919F3E5DB9D81B7346F9D7EA6D9155DC0F7BA8E472552"
@@ -157,7 +153,7 @@ The vaults of PartyA and PartyB should both display the following output:
       recordedTime: 1506415268.875000000
       consumedTime: null
       status: "UNCONSUMED"
-      notary: "C=GB,L=London,O=NetworkMapAndNotary,CN=corda.notary.validating"
+      notary: "C=GB,L=London,O=Notary"
       lockId: null
       lockUpdateTime: 1506415269.548000000
     totalStatesAvailable: -1

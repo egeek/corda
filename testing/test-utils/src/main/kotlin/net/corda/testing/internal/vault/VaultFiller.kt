@@ -15,8 +15,13 @@ import net.corda.core.utilities.getOrThrow
 import net.corda.finance.contracts.Commodity
 import net.corda.finance.contracts.DealState
 import net.corda.finance.contracts.asset.Cash
-import net.corda.finance.contracts.asset.CommodityContract
+import net.corda.finance.contracts.asset.Obligation
+import net.corda.finance.contracts.asset.OnLedgerAsset
+import net.corda.testing.contracts.DummyContract
+import net.corda.testing.contracts.DummyState
 import net.corda.testing.core.*
+import net.corda.testing.internal.chooseIdentity
+import net.corda.testing.internal.chooseIdentityAndCert
 import java.security.PublicKey
 import java.time.Duration
 import java.time.Instant
@@ -93,6 +98,7 @@ class VaultFiller @JvmOverloads constructor(
     fun fillWithSomeTestLinearStates(numberToCreate: Int,
                                      externalId: String? = null,
                                      participants: List<AbstractParty> = emptyList(),
+                                     uniqueIdentifier: UniqueIdentifier? = null,
                                      linearString: String = "",
                                      linearNumber: Long = 0L,
                                      linearBoolean: Boolean = false,
@@ -105,7 +111,7 @@ class VaultFiller @JvmOverloads constructor(
             // Issue a Linear state
             val dummyIssue = TransactionBuilder(notary = defaultNotary.party).apply {
                 addOutputState(DummyLinearContract.State(
-                        linearId = UniqueIdentifier(externalId),
+                        linearId = uniqueIdentifier ?: UniqueIdentifier(externalId),
                         participants = participants.plus(me),
                         linearString = linearString,
                         linearNumber = linearNumber,
@@ -164,19 +170,43 @@ class VaultFiller @JvmOverloads constructor(
         return Vault(states)
     }
 
+
+    /**
+     * Records a dummy state in the Vault (useful for creating random states when testing vault queries)
+     */
+    fun fillWithDummyState() : Vault<DummyState> {
+        val outputState = TransactionState(
+                data = DummyState(Random().nextInt(), participants = listOf(services.myInfo.singleIdentity())),
+                contract = DummyContract.PROGRAM_ID,
+                notary = defaultNotary.party
+        )
+        val builder = TransactionBuilder()
+                .addOutputState(outputState)
+                .addCommand(DummyCommandData, defaultNotary.party.owningKey)
+        val stxn = services.signInitialTransaction(builder)
+        services.recordTransactions(stxn)
+        return Vault(setOf(stxn.tx.outRef(0)))
+    }
+
+    /**
+     * Puts together an issuance transaction for the specified amount that starts out being owned by the given pubkey.
+     */
+    fun generateCommoditiesIssue(tx: TransactionBuilder, amount: Amount<Issued<Commodity>>, owner: AbstractParty, notary: Party)
+            = OnLedgerAsset.generateIssue(tx, TransactionState(CommodityState(amount, owner), Obligation.PROGRAM_ID, notary), Obligation.Commands.Issue())
+
+
     /**
      *
      * @param issuerServices service hub of the issuer node, which will be used to sign the transaction.
      * @return a vault object that represents the generated states (it will NOT be the full vault from the service hub!).
      */
     // TODO: need to make all FungibleAsset commands (issue, move, exit) generic
-    fun fillWithSomeTestCommodity(amount: Amount<Commodity>, issuerServices: ServiceHub, issuedBy: PartyAndReference): Vault<CommodityContract.State> {
+    fun fillWithSomeTestCommodity(amount: Amount<Commodity>, issuerServices: ServiceHub, issuedBy: PartyAndReference): Vault<CommodityState> {
         val myKey: PublicKey = services.myInfo.chooseIdentity().owningKey
         val me = AnonymousParty(myKey)
 
-        val commodity = CommodityContract()
         val issuance = TransactionBuilder(null as Party?)
-        commodity.generateIssue(issuance, Amount(amount.quantity, Issued(issuedBy, amount.token)), me, altNotary)
+        generateCommoditiesIssue(issuance, Amount(amount.quantity, Issued(issuedBy, amount.token)), me, altNotary)
         val transaction = issuerServices.signInitialTransaction(issuance, issuedBy.party.owningKey)
         services.recordTransactions(transaction)
         return Vault(setOf(transaction.tx.outRef(0)))
@@ -239,3 +269,27 @@ class VaultFiller @JvmOverloads constructor(
         return update.getOrThrow(Duration.ofSeconds(3))
     }
 }
+
+
+
+/** A state representing a commodity claim against some party */
+data class CommodityState(
+        override val amount: Amount<Issued<Commodity>>,
+
+        /** There must be a MoveCommand signed by this key to claim the amount */
+        override val owner: AbstractParty
+) : FungibleAsset<Commodity> {
+    constructor(deposit: PartyAndReference, amount: Amount<Commodity>, owner: AbstractParty)
+            : this(Amount(amount.quantity, Issued(deposit, amount.token)), owner)
+
+    override val exitKeys: Set<PublicKey> = Collections.singleton(owner.owningKey)
+    override val participants = listOf(owner)
+
+    override fun withNewOwnerAndAmount(newAmount: Amount<Issued<Commodity>>, newOwner: AbstractParty): FungibleAsset<Commodity>
+            = copy(amount = amount.copy(newAmount.quantity), owner = newOwner)
+
+    override fun toString() = "Commodity($amount at ${amount.token.issuer} owned by $owner)"
+
+    override fun withNewOwner(newOwner: AbstractParty) = CommandAndState(Obligation.Commands.Move(), copy(owner = newOwner))
+}
+

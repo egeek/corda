@@ -7,6 +7,8 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 import java.io.NotSerializableException;
+import java.util.ArrayList;
+import java.util.List;
 
 public class SetterConstructorTests {
 
@@ -62,6 +64,13 @@ public class SetterConstructorTests {
         private void setA(int a) { this.a = a; }
         public void setB(int b) { this.b = b; }
         public void setC(int c) { this.c = c; }
+    }
+
+    static class CIntList {
+        private List<Integer> l;
+
+        public List getL() { return l; }
+        public void setL(List<Integer> l) { this.l = l; }
     }
 
     static class Inner1 {
@@ -286,12 +295,8 @@ public class SetterConstructorTests {
         tm.setA(10);
         assertEquals("10", tm.getA());
 
-        TypeMismatch post = new DeserializationInput(factory1).deserialize(new SerializationOutput(factory1).serialize(tm),
-                TypeMismatch.class);
-
-        // because there is a type mismatch in the class, it won't return that info as a BEAN property and thus
-        // we won't serialise it and thus on deserialization it won't be initialized
-        Assertions.assertThatThrownBy(() -> post.getA()).isInstanceOf(NullPointerException.class);
+        Assertions.assertThatThrownBy(() -> new SerializationOutput(factory1).serialize(tm)).isInstanceOf (
+                NotSerializableException.class);
     }
 
     @Test
@@ -306,11 +311,30 @@ public class SetterConstructorTests {
         tm.setA("10");
         assertEquals((Integer)10, tm.getA());
 
-        TypeMismatch2 post = new DeserializationInput(factory1).deserialize(new SerializationOutput(factory1).serialize(tm),
-                TypeMismatch2.class);
+        Assertions.assertThatThrownBy(() -> new SerializationOutput(factory1).serialize(tm)).isInstanceOf(
+                NotSerializableException.class);
+    }
 
-        // because there is a type mismatch in the class, it won't return that info as a BEAN property and thus
-        // we won't serialise it and thus on deserialization it won't be initialized
-        assertEquals(null, post.getA());
+    // This not blowing up means it's working
+    @Test
+    public void intList() throws NotSerializableException {
+        CIntList cil = new CIntList();
+
+        List<Integer> l = new ArrayList<>();
+        l.add(1);
+        l.add(2);
+        l.add(3);
+
+        cil.setL(l);
+
+        EvolutionSerializerGetterBase evolutionSerializerGetter = new EvolutionSerializerGetter();
+        SerializerFactory factory1 = new SerializerFactory(
+                AllWhitelist.INSTANCE,
+                ClassLoader.getSystemClassLoader(),
+                evolutionSerializerGetter);
+
+        // if we've got super / sub types on the setter vs the underlying type the wrong way around this will
+        // explode. See CORDA-1229 (https://r3-cev.atlassian.net/browse/CORDA-1229)
+        new DeserializationInput(factory1).deserialize(new SerializationOutput(factory1).serialize(cil), CIntList.class);
     }
 }

@@ -24,7 +24,7 @@ class ContractAttachmentSerializerTest {
     private lateinit var factory: SerializationFactory
     private lateinit var context: SerializationContext
     private lateinit var contextWithToken: SerializationContext
-    private val mockServices = MockServices(emptyList(), rigorousMock(), CordaX500Name("MegaCorp", "London", "GB"))
+    private val mockServices = MockServices(emptyList(), CordaX500Name("MegaCorp", "London", "GB"), rigorousMock())
 
     @Before
     fun setup() {
@@ -42,6 +42,7 @@ class ContractAttachmentSerializerTest {
 
         assertEquals(contractAttachment.id, deserialized.attachment.id)
         assertEquals(contractAttachment.contract, deserialized.contract)
+        assertEquals(contractAttachment.additionalContracts, deserialized.additionalContracts)
         assertArrayEquals(contractAttachment.open().readBytes(), deserialized.open().readBytes())
     }
 
@@ -57,6 +58,7 @@ class ContractAttachmentSerializerTest {
 
         assertEquals(contractAttachment.id, deserialized.attachment.id)
         assertEquals(contractAttachment.contract, deserialized.contract)
+        assertEquals(contractAttachment.additionalContracts, deserialized.additionalContracts)
         assertArrayEquals(contractAttachment.open().readBytes(), deserialized.open().readBytes())
     }
 

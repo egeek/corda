@@ -2,16 +2,13 @@
  * This build.gradle exists to package Node Explorer as an executable fat jar.
  */
 apply plugin: 'us.kirchmeier.capsule'
+apply plugin: 'net.corda.plugins.publish-utils'
+apply plugin: 'com.jfrog.artifactory'
 
 description 'Node Explorer'
 
-repositories {
-    mavenLocal()
-    mavenCentral()
-    maven {
-        url 'http://oss.sonatype.org/content/repositories/snapshots'
-    }
-    jcenter()
+configurations {
+    runtimeArtifacts.extendsFrom runtime
 }
 
 // Force the Caplet to target Java 6. This ensures that running 'java -jar explorer.jar' on any Java 6 VM upwards
@@ -40,12 +37,28 @@ task buildExplorerJAR(type: FatCapsule, dependsOn: project(':tools:explorer').co
         caplets = ['ExplorerCaplet']
 
         // JVM configuration:
-        // - Constrain to small heap sizes to ease development on low end devices.
         // - Switch to the G1 GC which is going to be the default in Java 9 and gives low pause times/string dedup.
         //
         // If you change these flags, please also update Driver.kt
-        jvmArgs = ['-Xmx200m', '-XX:+UseG1GC']
+        jvmArgs = ['-XX:+UseG1GC']
     }
 }
 
-build.dependsOn buildExplorerJAR
+assemble.dependsOn buildExplorerJAR
+
+artifacts {
+    runtimeArtifacts buildExplorerJAR
+    publish buildExplorerJAR {
+        classifier ""
+    }
+}
+
+jar {
+    classifier "ignore"
+    enabled = false
+}
+
+publish {
+    disableDefaultJar = true
+    name 'corda-tools-explorer'
+}

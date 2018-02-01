@@ -5,10 +5,11 @@ import net.corda.node.services.api.Checkpoint
 import net.corda.node.services.api.CheckpointStorage
 import net.corda.nodeapi.internal.persistence.NODE_DATABASE_PREFIX
 import net.corda.nodeapi.internal.persistence.currentDBSession
+import java.io.Serializable
 import javax.persistence.Column
 import javax.persistence.Entity
 import javax.persistence.Id
-import javax.persistence.Lob
+import org.hibernate.annotations.Type
 
 /**
  * Simple checkpoint key value storage in DB.
@@ -22,10 +23,10 @@ class DBCheckpointStorage : CheckpointStorage {
             @Column(name = "checkpoint_id", length = 64)
             var checkpointId: String = "",
 
-            @Lob
             @Column(name = "checkpoint_value")
+            @Type(type="org.hibernate.type.ImageType")
             var checkpoint: ByteArray = ByteArray(0)
-    )
+    ) : Serializable
 
     override fun addCheckpoint(checkpoint: Checkpoint) {
         currentDBSession().save(DBCheckpoint().apply {

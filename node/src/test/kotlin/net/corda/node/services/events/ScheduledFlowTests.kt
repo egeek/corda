@@ -2,7 +2,7 @@ package net.corda.node.services.events
 
 import co.paralleluniverse.fibers.Suspendable
 import net.corda.core.concurrent.CordaFuture
-import net.corda.core.context.Origin
+import net.corda.core.context.InvocationOrigin
 import net.corda.core.contracts.*
 import net.corda.core.flows.FinalityFlow
 import net.corda.core.flows.FlowLogic
@@ -11,8 +11,6 @@ import net.corda.core.flows.SchedulableFlow
 import net.corda.core.identity.Party
 import net.corda.core.node.services.VaultService
 import net.corda.core.node.services.queryBy
-import net.corda.core.node.services.vault.DEFAULT_PAGE_NUM
-import net.corda.core.node.services.vault.PageSpecification
 import net.corda.core.node.services.vault.QueryCriteria.VaultQueryCriteria
 import net.corda.core.node.services.vault.Sort
 import net.corda.core.node.services.vault.SortAttribute
@@ -25,9 +23,10 @@ import net.corda.testing.core.ALICE_NAME
 import net.corda.testing.core.BOB_NAME
 import net.corda.testing.core.dummyCommand
 import net.corda.testing.core.singleIdentity
-import net.corda.testing.node.MockNetwork
-import net.corda.testing.node.MockNodeParameters
-import net.corda.testing.node.startFlow
+import net.corda.testing.node.internal.InternalMockNetwork
+import net.corda.testing.node.internal.InternalMockNetwork.MockNode
+import net.corda.testing.node.internal.InternalMockNodeParameters
+import net.corda.testing.node.internal.startFlow
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -42,9 +41,9 @@ class ScheduledFlowTests {
         val SORTING = Sort(listOf(Sort.SortColumn(SortAttribute.Standard(Sort.CommonStateAttribute.STATE_REF_TXN_ID), Sort.Direction.DESC)))
     }
 
-    private lateinit var mockNet: MockNetwork
-    private lateinit var aliceNode: StartedNode<MockNetwork.MockNode>
-    private lateinit var bobNode: StartedNode<MockNetwork.MockNode>
+    private lateinit var mockNet: InternalMockNetwork
+    private lateinit var aliceNode: StartedNode<MockNode>
+    private lateinit var bobNode: StartedNode<MockNode>
     private lateinit var notary: Party
     private lateinit var alice: Party
     private lateinit var bob: Party
@@ -102,9 +101,9 @@ class ScheduledFlowTests {
 
     @Before
     fun setup() {
-        mockNet = MockNetwork(threadPerNode = true, cordappPackages = listOf("net.corda.testing.contracts"))
-        aliceNode = mockNet.createNode(MockNodeParameters(legalName = ALICE_NAME))
-        bobNode = mockNet.createNode(MockNodeParameters(legalName = BOB_NAME))
+        mockNet = InternalMockNetwork(cordappPackages = listOf("net.corda.testing.contracts"), threadPerNode = true)
+        aliceNode = mockNet.createNode(InternalMockNodeParameters(legalName = ALICE_NAME))
+        bobNode = mockNet.createNode(InternalMockNodeParameters(legalName = BOB_NAME))
         notary = mockNet.defaultNotaryIdentity
         alice = aliceNode.info.singleIdentity()
         bob = bobNode.info.singleIdentity()
@@ -121,7 +120,7 @@ class ScheduledFlowTests {
         aliceNode.smm.track().updates.subscribe {
             if (it is StateMachineManager.Change.Add) {
                 val context = it.logic.stateMachine.context
-                if (context.origin is Origin.Scheduled)
+                if (context.origin is InvocationOrigin.Scheduled)
                     countScheduledFlows++
             }
         }
@@ -140,7 +139,7 @@ class ScheduledFlowTests {
 
     @Test
     fun `run a whole batch of scheduled flows`() {
-        val N = 100
+        val N = 99
         val futures = mutableListOf<CordaFuture<*>>()
         for (i in 0 until N) {
             futures.add(aliceNode.services.startFlow(InsertInitialStateFlow(bob, notary)).resultFuture)
@@ -153,10 +152,10 @@ class ScheduledFlowTests {
 
         // Convert the states into maps to make error reporting easier
         val statesFromA: List<StateAndRef<ScheduledState>> = aliceNode.database.transaction {
-            queryStatesWithPaging(aliceNode.services.vaultService)
+            queryStates(aliceNode.services.vaultService)
         }
         val statesFromB: List<StateAndRef<ScheduledState>> = bobNode.database.transaction {
-            queryStatesWithPaging(bobNode.services.vaultService)
+            queryStates(bobNode.services.vaultService)
         }
         assertEquals("Expect all states to be present", 2 * N, statesFromA.count())
         statesFromA.forEach { ref ->
@@ -173,23 +172,6 @@ class ScheduledFlowTests {
         assertTrue("Expect all states have run the scheduled task", statesFromB.all { it.state.data.processed })
     }
 
-    /**
-     * Query all states from the Vault, fetching results as a series of pages with ordered states in order to perform
-     * integration testing of that functionality.
-     *
-     * @return states ordered by the transaction ID.
-     */
-    private fun queryStatesWithPaging(vaultService: VaultService): List<StateAndRef<ScheduledState>> {
-        // DOCSTART VaultQueryExamplePaging
-        var pageNumber = DEFAULT_PAGE_NUM
-        val states = mutableListOf<StateAndRef<ScheduledState>>()
-        do {
-            val pageSpec = PageSpecification(pageSize = PAGE_SIZE, pageNumber = pageNumber)
-            val results = vaultService.queryBy<ScheduledState>(VaultQueryCriteria(), pageSpec, SORTING)
-            states.addAll(results.states)
-            pageNumber++
-        } while ((pageSpec.pageSize * (pageNumber)) <= results.totalStatesAvailable)
-        // DOCEND VaultQueryExamplePaging
-        return states.toList()
-    }
+    private fun queryStates(vaultService: VaultService): List<StateAndRef<ScheduledState>> =
+        vaultService.queryBy<ScheduledState>(VaultQueryCriteria(), sorting = SORTING).states
 }

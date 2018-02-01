@@ -3,8 +3,10 @@ package net.corda.node.utilities.registration
 import net.corda.core.crypto.Crypto
 import net.corda.core.identity.CordaX500Name
 import net.corda.core.internal.*
-import net.corda.core.utilities.seconds
+import net.corda.node.NodeRegistrationOption
 import net.corda.node.services.config.NodeConfiguration
+import net.corda.nodeapi.internal.DevIdentityGenerator
+import net.corda.nodeapi.internal.config.SSLConfiguration
 import net.corda.nodeapi.internal.crypto.CertificateType
 import net.corda.nodeapi.internal.crypto.X509KeyStore
 import net.corda.nodeapi.internal.crypto.X509Utilities
@@ -13,22 +15,33 @@ import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_CLIENT_TLS
 import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_ROOT_CA
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter
 import org.bouncycastle.util.io.pem.PemObject
+import java.io.IOException
 import java.io.StringWriter
 import java.nio.file.Path
 import java.security.KeyPair
 import java.security.KeyStore
 import java.security.cert.X509Certificate
+import java.time.Duration
+import javax.naming.ServiceUnavailableException
 
 /**
  * Helper for managing the node registration process, which checks for any existing certificates and requests them if
  * needed.
  */
-class NetworkRegistrationHelper(private val config: NodeConfiguration,
+class NetworkRegistrationHelper(private val config: SSLConfiguration,
+                                private val myLegalName: CordaX500Name,
+                                private val emailAddress: String,
                                 private val certService: NetworkRegistrationService,
-                                networkRootTrustStorePath: Path,
-                                networkRootTruststorePassword: String) {
+                                private val networkRootTrustStorePath: Path,
+                                networkRootTrustStorePassword: String,
+                                private val certRole: CertRole,
+                                private val nextIdleDuration: (Duration?) -> Duration? = FixedPeriodLimitedRetrialStrategy(10, Duration.ofMinutes(1))) {
+
+    // Constructor for corda node, cert role is restricted to [CertRole.NODE_CA].
+    constructor(config: NodeConfiguration, certService: NetworkRegistrationService, regConfig: NodeRegistrationOption) :
+            this(config, config.myLegalName, config.emailAddress, certService, regConfig.networkRootTrustStorePath, regConfig.networkRootTrustStorePassword, CertRole.NODE_CA)
+
     private companion object {
-        val pollInterval = 10.seconds
         const val SELF_SIGNED_PRIVATE_KEY = "Self Signed Private Key"
     }
 
@@ -43,7 +56,7 @@ class NetworkRegistrationHelper(private val config: NodeConfiguration,
             "$networkRootTrustStorePath does not exist. This file must contain the root CA cert of your compatibility zone. " +
                     "Please contact your CZ operator."
         }
-        rootTrustStore = X509KeyStore.fromFile(networkRootTrustStorePath, networkRootTruststorePassword)
+        rootTrustStore = X509KeyStore.fromFile(networkRootTrustStorePath, networkRootTrustStorePassword)
         rootCert = rootTrustStore.getCertificate(CORDA_ROOT_CA)
     }
 
@@ -70,7 +83,7 @@ class NetworkRegistrationHelper(private val config: NodeConfiguration,
         // We use the self sign certificate to store the key temporarily in the keystore while waiting for the request approval.
         if (SELF_SIGNED_PRIVATE_KEY !in nodeKeyStore) {
             val keyPair = Crypto.generateKeyPair(X509Utilities.DEFAULT_TLS_SIGNATURE_SCHEME)
-            val selfSignCert = X509Utilities.createSelfSignedCACertificate(config.myLegalName.x500Principal, keyPair)
+            val selfSignCert = X509Utilities.createSelfSignedCACertificate(myLegalName.x500Principal, keyPair)
             // Save to the key store.
             nodeKeyStore.setPrivateKey(SELF_SIGNED_PRIVATE_KEY, keyPair.private, listOf(selfSignCert), keyPassword = privateKeyPassword)
             nodeKeyStore.save()
@@ -89,57 +102,74 @@ class NetworkRegistrationHelper(private val config: NodeConfiguration,
             throw certificateRequestException
         }
 
-        val nodeCaCert = certificates[0]
+        val certificate = certificates.first()
 
         val nodeCaSubject = try {
-            CordaX500Name.build(nodeCaCert.subjectX500Principal)
+            CordaX500Name.build(certificate.subjectX500Principal)
         } catch (e: IllegalArgumentException) {
             throw CertificateRequestException("Received node CA cert has invalid subject name: ${e.message}")
         }
-        if (nodeCaSubject != config.myLegalName) {
+        if (nodeCaSubject != myLegalName) {
             throw CertificateRequestException("Subject of received node CA cert doesn't match with node legal name: $nodeCaSubject")
         }
 
         val nodeCaCertRole = try {
-            CertRole.extract(nodeCaCert)
+            CertRole.extract(certificate)
         } catch (e: IllegalArgumentException) {
             throw CertificateRequestException("Unable to extract cert role from received node CA cert: ${e.message}")
-        }
-        if (nodeCaCertRole != CertRole.NODE_CA) {
-            throw CertificateRequestException("Received node CA cert has invalid role: $nodeCaCertRole")
         }
 
         // Validate certificate chain returned from the doorman with the root cert obtained via out-of-band process, to prevent MITM attack on doorman server.
         X509Utilities.validateCertificateChain(rootCert, certificates)
 
         println("Certificate signing request approved, storing private key with the certificate chain.")
-        // Save private key and certificate chain to the key store.
-        nodeKeyStore.setPrivateKey(CORDA_CLIENT_CA, keyPair.private, certificates, keyPassword = privateKeyPassword)
-        nodeKeyStore.internal.deleteEntry(SELF_SIGNED_PRIVATE_KEY)
-        nodeKeyStore.save()
-        println("Node private key and certificate stored in ${config.nodeKeystore}.")
 
+        when (nodeCaCertRole) {
+            CertRole.NODE_CA -> {
+                // Save private key and certificate chain to the key store.
+                nodeKeyStore.setPrivateKey(CORDA_CLIENT_CA, keyPair.private, certificates, keyPassword = privateKeyPassword)
+                nodeKeyStore.internal.deleteEntry(SELF_SIGNED_PRIVATE_KEY)
+                nodeKeyStore.save()
+                println("Node private key and certificate stored in ${config.nodeKeystore}.")
+
+                config.loadSslKeyStore(createNew = true).update {
+                    println("Generating SSL certificate for node messaging service.")
+                    val sslKeyPair = Crypto.generateKeyPair(X509Utilities.DEFAULT_TLS_SIGNATURE_SCHEME)
+                    val sslCert = X509Utilities.createCertificate(
+                            CertificateType.TLS,
+                            certificate,
+                            keyPair,
+                            myLegalName.x500Principal,
+                            sslKeyPair.public)
+                    setPrivateKey(CORDA_CLIENT_TLS, sslKeyPair.private, listOf(sslCert) + certificates)
+                }
+                println("SSL private key and certificate stored in ${config.sslKeystore}.")
+            }
+            // TODO: Fix this, this is not needed in corda node.
+            CertRole.SERVICE_IDENTITY -> {
+                // Only create keystore containing notary's key for service identity role.
+                nodeKeyStore.setPrivateKey("${DevIdentityGenerator.DISTRIBUTED_NOTARY_ALIAS_PREFIX}-private-key", keyPair.private, certificates, keyPassword = privateKeyPassword)
+                nodeKeyStore.internal.deleteEntry(SELF_SIGNED_PRIVATE_KEY)
+                nodeKeyStore.save()
+                println("Service identity private key and certificate stored in ${config.nodeKeystore}.")
+            }
+            else -> throw CertificateRequestException("Received node CA cert has invalid role: $nodeCaCertRole")
+        }
         // Save root certificates to trust store.
         config.loadTrustStore(createNew = true).update {
             println("Generating trust store for corda node.")
+            if (this.aliases().hasNext()) {
+                println("The node's trust store already exists. The following certificates will be overridden: ${this.aliases().asSequence()}")
+            }
             // Assumes certificate chain always starts with client certificate and end with root certificate.
             setCertificate(CORDA_ROOT_CA, certificates.last())
+            rootTrustStore.aliases().asSequence().filter { it != CORDA_ROOT_CA }.forEach {
+                val certificate = rootTrustStore.getCertificate(it)
+                println("Copying trusted certificate to the node's trust store: Alias: $it, Certificate: $certificate")
+                setCertificate(it, certificate)
+            }
         }
         println("Node trust store stored in ${config.trustStoreFile}.")
-
-        config.loadSslKeyStore(createNew = true).update {
-            println("Generating SSL certificate for node messaging service.")
-            val sslKeyPair = Crypto.generateKeyPair(X509Utilities.DEFAULT_TLS_SIGNATURE_SCHEME)
-            val sslCert = X509Utilities.createCertificate(
-                    CertificateType.TLS,
-                    nodeCaCert,
-                    keyPair,
-                    config.myLegalName.x500Principal,
-                    sslKeyPair.public)
-            setPrivateKey(CORDA_CLIENT_TLS, sslKeyPair.private, listOf(sslCert) + certificates)
-        }
-        println("SSL private key and certificate stored in ${config.sslKeystore}.")
-
         // All done, clean up temp files.
         requestIdStore.deleteIfExists()
     }
@@ -148,17 +178,28 @@ class NetworkRegistrationHelper(private val config: NodeConfiguration,
      * Poll Certificate Signing Server for approved certificate,
      * enter a slow polling loop if server return null.
      * @param requestId Certificate signing request ID.
-     * @return Map of certificate chain.
+     * @return List of certificate chain.
      */
     private fun pollServerForCertificates(requestId: String): List<X509Certificate> {
         println("Start polling server for certificate signing approval.")
         // Poll server to download the signed certificate once request has been approved.
-        var certificates = certService.retrieveCertificates(requestId)
-        while (certificates == null) {
-            Thread.sleep(pollInterval.toMillis())
-            certificates = certService.retrieveCertificates(requestId)
+        var idlePeriodDuration: Duration? = null
+        while (true) {
+            try {
+                val (pollInterval, certificates) = certService.retrieveCertificates(requestId)
+                if (certificates != null) {
+                    return certificates
+                }
+                Thread.sleep(pollInterval.toMillis())
+            } catch (e: ServiceUnavailableException) {
+                idlePeriodDuration = nextIdleDuration(idlePeriodDuration)
+                if (idlePeriodDuration != null) {
+                    Thread.sleep(idlePeriodDuration.toMillis())
+                } else {
+                    throw UnableToRegisterNodeWithDoormanException()
+                }
+            }
         }
-        return certificates
     }
 
     /**
@@ -170,15 +211,15 @@ class NetworkRegistrationHelper(private val config: NodeConfiguration,
     private fun submitOrResumeCertificateSigningRequest(keyPair: KeyPair): String {
         // Retrieve request id from file if exists, else post a request to server.
         return if (!requestIdStore.exists()) {
-            val request = X509Utilities.createCertificateSigningRequest(config.myLegalName.x500Principal, config.emailAddress, keyPair)
+            val request = X509Utilities.createCertificateSigningRequest(myLegalName.x500Principal, emailAddress, keyPair, certRole)
             val writer = StringWriter()
             JcaPEMWriter(writer).use {
                 it.writeObject(PemObject("CERTIFICATE REQUEST", request.encoded))
             }
             println("Certificate signing request with the following information will be submitted to the Corda certificate signing server.")
             println()
-            println("Legal Name: ${config.myLegalName}")
-            println("Email: ${config.emailAddress}")
+            println("Legal Name: $myLegalName")
+            println("Email: $emailAddress")
             println()
             println("Public Key: ${keyPair.public}")
             println()
@@ -194,6 +235,20 @@ class NetworkRegistrationHelper(private val config: NodeConfiguration,
             val requestId = requestIdStore.readLines { it.findFirst().get() }
             println("Resuming from previous certificate signing request, request ID: $requestId.")
             requestId
+        }
+    }
+}
+
+class UnableToRegisterNodeWithDoormanException : IOException()
+
+private class FixedPeriodLimitedRetrialStrategy(times: Int, private val period: Duration) : (Duration?) -> Duration? {
+    init {
+        require(times > 0)
+    }
+    private var counter = times
+    override fun invoke(@Suppress("UNUSED_PARAMETER") previousPeriod: Duration?): Duration? {
+        synchronized(this) {
+            return if (counter-- > 0) period else null
         }
     }
 }

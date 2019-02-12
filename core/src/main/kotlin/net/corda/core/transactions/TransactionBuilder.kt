@@ -175,15 +175,15 @@ open class TransactionBuilder(
             val missingClass = e.message
             requireNotNull(missingClass) { "Transaction is incorrectly formed." }
 
-            val attachment = services.attachments.internalFindTrustedAttachmentForClass(missingClass!!)
+            val attachmentId = services.cordappProvider.getContractAttachmentID(missingClass!!)
                     ?: throw IllegalArgumentException("Attempted to find dependent attachment for class $missingClass, but could not find a suitable candidate.")
 
             log.warnOnce("""The transaction currently built is missing an attachment for class: $missingClass.
-                    Automatically attaching contract dependency $attachment.
+                    Automatically attaching contract dependency $attachmentId.
                     It is strongly recommended to check that this is the desired attachment, and to manually add it to the transaction builder.
                 """.trimIndent())
 
-            addAttachment(attachment.id)
+            addAttachment(attachmentId)
             return true
             // Ignore these exceptions as they will break unit tests.
             //  The point here is only to detect missing dependencies. The other exceptions are irrelevant.
@@ -279,37 +279,6 @@ open class TransactionBuilder(
             services: ServicesForResolution
     ): Pair<Set<AttachmentId>, List<TransactionState<ContractState>>?> {
         val inputsAndOutputs = (inputStates ?: emptyList()) + (outputStates ?: emptyList())
-
-        // Hash to Signature constraints migration switchover (only applicable from version 4 onwards)
-        // identify if any input-output pairs are transitioning from hash to signature constraints:
-        // 1. output states contain implicitly selected hash constraint (pre-existing from set of unconsumed states in a nodes vault) or explicitly set SignatureConstraint
-        // 2. node has signed jar for associated contract class and version
-        if (services.networkParameters.minimumPlatformVersion >= 4) {
-            val inputsHashConstraints = inputStates?.filter { it.constraint is HashAttachmentConstraint } ?: emptyList()
-            val outputHashConstraints = outputStates?.filter { it.constraint is HashAttachmentConstraint } ?: emptyList()
-            val outputSignatureConstraints = outputStates?.filter { it.constraint is SignatureAttachmentConstraint } ?: emptyList()
-            if (inputsHashConstraints.isNotEmpty() && (outputHashConstraints.isNotEmpty() || outputSignatureConstraints.isNotEmpty())) {
-                val attachmentIds = services.attachments.getLatestContractAttachments(contractClassName)
-                // only switchover if we have both signed and unsigned attachments for the given contract class name
-                if (attachmentIds.isNotEmpty() && attachmentIds.size == 2) {
-                    val attachmentsToUse = attachmentIds.map {
-                        services.attachments.openAttachment(it)?.let { it as ContractAttachment }
-                                ?: throw IllegalArgumentException("Contract attachment $it for $contractClassName is missing.")
-                    }
-                    val signedAttachment = attachmentsToUse.filter { it.isSigned }.firstOrNull()
-                            ?: throw IllegalArgumentException("Signed contract attachment for $contractClassName is missing.")
-                    val outputConstraints =
-                            if (outputHashConstraints.isNotEmpty()) {
-                                log.warn("Switching output states from hash to signed constraints using signers in signed contract attachment given by ${signedAttachment.id}")
-                                val outputsSignatureConstraints = outputHashConstraints.map { it.copy(constraint = SignatureAttachmentConstraint(signedAttachment.signerKeys.first())) }
-                                outputs.addAll(outputsSignatureConstraints)
-                                outputs.removeAll(outputHashConstraints)
-                                outputsSignatureConstraints
-                            } else outputSignatureConstraints
-                    return Pair(attachmentIds.toSet(), outputConstraints)
-                }
-            }
-        }
 
         // Determine if there are any HashConstraints that pin the version of a contract. If there are, check if we trust them.
         val hashAttachments = inputsAndOutputs
@@ -467,7 +436,7 @@ open class TransactionBuilder(
         require(isReference || constraints.none { it is HashAttachmentConstraint })
 
         val minimumRequiredContractClassVersion = stateRefs?.map { services.loadContractAttachment(it).contractVersion }?.max() ?: DEFAULT_CORDAPP_VERSION
-        return services.attachments.getLatestContractAttachments(contractClassName, minimumRequiredContractClassVersion).firstOrNull()
+        return services.cordappProvider.getContractAttachmentID(contractClassName)
                 ?: throw MissingContractAttachments(states, contractClassName, minimumRequiredContractClassVersion)
     }
 
